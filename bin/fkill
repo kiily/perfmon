@@ -12,6 +12,8 @@ MATCH=""
 QUERY=""
 LIST=0
 FORCE=0
+WAIT=5
+ESCALATE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -21,6 +23,11 @@ while [ $# -gt 0 ]; do
       MATCH="$2"; shift 2 ;;
     --list) LIST=1; shift ;;
     --force) FORCE=1; shift ;;
+    --escalate) ESCALATE=1; shift ;;
+    --wait)
+      [ $# -ge 2 ] || { echo "fkill: missing value for --wait" >&2; exit 1; }
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "fkill: --wait must be a positive integer (seconds)" >&2; exit 1; }
+      WAIT="$2"; shift 2 ;;
     -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
     *) QUERY="$1"; shift ;;
   esac
@@ -87,6 +94,25 @@ else
   [ -z "$SELECTED" ] && { echo "fkill: nothing selected"; exit 0; }
 fi
 
+# Death check: gone (ps exits nonzero / empty) or zombie (state starts with Z —
+# kill -0 succeeds on zombies, so it is the wrong liveness test).
+is_dead() {
+  local st
+  st=$(ps -p "$1" -o state= 2>/dev/null | tr -d '[:space:]') || return 0
+  [ -z "$st" ] && return 0
+  case "$st" in Z*) return 0 ;; *) return 1 ;; esac
+}
+
+# Poll up to $WAIT seconds (0.1s steps) for the PID to die.
+wait_dead() {
+  local i=0 n=$((WAIT * 10))
+  while [ "$i" -lt "$n" ]; do
+    is_dead "$1" && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  is_dead "$1"
+}
+
 FAILED=0
 while read -r mem pid cmd; do
   # PID-reuse guard: re-read the command and make sure it is still the process
@@ -97,10 +123,24 @@ while read -r mem pid cmd; do
     *) echo "fkill: skipping $pid — command changed since selection (now: ${NOW:-gone})" >&2
        continue ;;
   esac
-  if kill "-$SIG" "$pid" 2>/dev/null; then
-    echo "killed (SIG$SIG) $pid  $cmd"
-  else
+  if ! kill "-$SIG" "$pid" 2>/dev/null; then
     echo "fkill: failed to signal $pid  $cmd" >&2
+    FAILED=1
+    continue
+  fi
+  # Honest reporting: "killed" only once the process is actually gone.
+  if wait_dead "$pid"; then
+    echo "killed (SIG$SIG) $pid  $cmd"
+  elif [ "$ESCALATE" -eq 1 ] && [ "$SIG" != KILL ]; then
+    kill -KILL "$pid" 2>/dev/null || true
+    if wait_dead "$pid"; then
+      echo "killed (SIGKILL after SIG$SIG) $pid  $cmd"
+    else
+      echo "fkill: $pid still running after SIGKILL  $cmd" >&2
+      FAILED=1
+    fi
+  else
+    echo "fkill: $pid still running after SIG$SIG (use --escalate or -9)  $cmd" >&2
     FAILED=1
   fi
 done <<< "$SELECTED"
