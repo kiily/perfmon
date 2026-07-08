@@ -1,17 +1,24 @@
 #!/bin/bash
 # fkill — fuzzy-find and kill processes. Memory-sorted list, fzf multi-select.
-# Usage: fkill [-9] [query]                    interactive (query pre-fills the fzf filter)
-#        fkill [-9] --match REGEX [--force]    non-interactive: kill all COMMAND matches
-#        fkill --list [--match REGEX | query]  print candidates without killing, exit 0
-# --match is case-insensitive and applies to the COMMAND column only (never PID/MEM).
-# More than 5 matches requires --force. Exit: 1 = no match/refused, 2 = a kill failed.
+# Usage: fkill [-9] [query]                     interactive (query pre-fills the fzf filter)
+#        fkill [-9] --match REGEX [--force]     kill all COMMAND matches (case-insensitive; >5 needs --force)
+#        fkill [-9] --port N                    kill the TCP listener(s) on port N
+#        fkill [-9] --app NAME [--force]        kill a whole app bundle, root first (confirms; --force skips)
+#        fkill --list [--match RE | --port N | --app NAME | query]   preview without killing
+# Options: --wait SECS  death-poll window (default 5)   --escalate  TERM→wait→KILL
+# Every kill is verified: "killed" only when the process is gone.
+# Selectors are mutually exclusive. Exit: 1 = no match/refused, 2 = kill failed or survivor.
 set -eu
 
 SIG=TERM
 MATCH=""
 QUERY=""
+PORT=""
+APP=""
 LIST=0
 FORCE=0
+WAIT=5
+ESCALATE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -19,9 +26,22 @@ while [ $# -gt 0 ]; do
     --match)
       [ $# -ge 2 ] || { echo "fkill: missing value for --match" >&2; exit 1; }
       MATCH="$2"; shift 2 ;;
+    --port)
+      [ $# -ge 2 ] || { echo "fkill: missing value for --port" >&2; exit 1; }
+      [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -ge 1 ] && [ "$2" -le 65535 ] || {
+        echo "fkill: --port must be 1-65535" >&2; exit 1; }
+      PORT="$2"; shift 2 ;;
+    --app)
+      [ $# -ge 2 ] || { echo "fkill: missing value for --app" >&2; exit 1; }
+      APP="$2"; shift 2 ;;
     --list) LIST=1; shift ;;
     --force) FORCE=1; shift ;;
-    -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+    --escalate) ESCALATE=1; shift ;;
+    --wait)
+      [ $# -ge 2 ] || { echo "fkill: missing value for --wait" >&2; exit 1; }
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || { echo "fkill: --wait must be a positive integer (seconds)" >&2; exit 1; }
+      WAIT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) QUERY="$1"; shift ;;
   esac
 done
@@ -45,39 +65,158 @@ MY_PGID=$(ps -o pgid= -p $$ | tr -d ' ')
 # helpers show up in the ps snapshot and must never be kill targets).
 # Optional $1: case-insensitive ERE applied to the COMMAND column only, with
 # the command's original spacing preserved (passed via env to avoid awk -v
-# backslash mangling).
+# backslash mangling). Optional $2: space-separated PID allowlist — only those
+# PIDs are emitted (exclusions still apply on top).
 candidates() {
-  local re="${1:-}"
+  local re="${1:-}" pids="${2:-}"
   ps -axo rss=,pgid=,pid=,command= | sort -rn | \
-    MATCH_RE="$re" awk -v excl="$(echo "$EXCLUDE" | tr '\n' ' ')" -v mypgid="$MY_PGID" '
+    MATCH_RE="$re" PID_FILTER="$pids" awk -v excl="$(echo "$EXCLUDE" | tr '\n' ' ')" -v mypgid="$MY_PGID" '
     BEGIN {
       n=split(excl, arr, " "); for (i=1;i<=n;i++) skip[arr[i]]=1
       re=tolower(ENVIRON["MATCH_RE"])
+      m=split(ENVIRON["PID_FILTER"], parr, " "); for (i=1;i<=m;i++) if (parr[i] != "") { only[parr[i]]=1; filtered=1 }
     }
     {
       rss=$1; pgid=$2; pid=$3
       line=$0   # strip the three numeric columns from the ORIGINAL text — spacing intact
       sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", line)
       if (pid in skip || pgid == mypgid) next
+      if (filtered && !(pid in only)) next
       if (re != "" && tolower(line) !~ re) next
       printf "%8.0f  %-6s %s\n", rss/1024, pid, line
     }'
 }
 
+# TCP LISTEN owner(s) of a port, one PID per line. lsof exits 1 with empty
+# output when nothing listens (or the listener belongs to another user).
+port_pids() { lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null || true; }
+
+# Resolve an app bundle's processes. Emits "root PID" / "member PID" lines.
+# Membership: comm (argv[0] path, spaces intact — grouping mirrors bin/memtop)
+# has <NAME>.app as its FIRST .app segment (exact basename, case-insensitive:
+# "Google Chrome" must not match "Google Chrome Dev"), plus transitive PPID
+# children of members (extension hosts rewrite their command line entirely and
+# carry no path). Root: Contents/MacOS/<binary> immediately after that segment
+# — segment counting is ambiguous (crashpad handlers etc. also have one .app
+# segment); oldest such match wins if several (nested same-name bundles exist).
+app_pids() {
+  ps -axo pid=,ppid=,etime=,comm= | APP_NAME="$1" awk '
+    function etsec(e, a, t, m, j, d, s) {
+      d = 0
+      if (split(e, a, "-") == 2) { d = a[1]; e = a[2] }
+      m = split(e, t, ":"); s = 0
+      for (j = 1; j <= m; j++) s = s * 60 + t[j]
+      return d * 86400 + s
+    }
+    BEGIN { target = tolower(ENVIRON["APP_NAME"] ".app") }
+    {
+      pid = $1; ppid = $2; et = $3
+      line = $0
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9:-]+[[:space:]]+/, "", line)
+      allppid[pid] = ppid
+      n = split(line, parts, "/")
+      idx = 0
+      for (i = 1; i <= n; i++) if (tolower(parts[i]) ~ /\.app$/) { idx = i; break }
+      if (idx == 0 || tolower(parts[idx]) != target) next
+      member[pid] = 1
+      if (n == idx + 3 && parts[idx+1] == "Contents" && parts[idx+2] == "MacOS")
+        rootcand[pid] = etsec(et)
+    }
+    END {
+      # transitive children of members (bounded sweep; ps output is finite)
+      do {
+        grew = 0
+        for (p in allppid)
+          if (!(p in member) && (allppid[p] in member)) { member[p] = 1; grew = 1 }
+      } while (grew)
+      best = -1; root = ""
+      for (p in rootcand) if (rootcand[p] > best) { best = rootcand[p]; root = p }
+      for (p in member)
+        if (p == root) print "root", p; else print "member", p
+    }'
+}
+
+# Selectors are mutually exclusive: --match | --port | --app | interactive query.
+NSEL=0
+[ -n "$MATCH" ] && NSEL=$((NSEL + 1))
+[ -n "$PORT" ] && NSEL=$((NSEL + 1))
+[ -n "$APP" ] && NSEL=$((NSEL + 1))
+if [ "$NSEL" -gt 1 ] || { [ -n "$QUERY" ] && { [ -n "$PORT" ] || [ -n "$APP" ]; }; }; then
+  echo "fkill: --match, --port, --app, and a query are mutually exclusive" >&2; exit 1
+fi
+
+# --app resolution is shared by --list and kill mode. Emits root-first PID
+# ordering (kill order). Empty PID sets must never reach candidates(): an
+# empty filter means "no filter", which would select every process.
+if [ -n "$APP" ]; then
+  APP_LINES=$(app_pids "$APP")
+  ROOT_PID=$(awk '$1 == "root" { print $2 }' <<< "$APP_LINES")
+  MEMBER_PIDS=$(awk '$1 == "member" { print $2 }' <<< "$APP_LINES" | tr '\n' ' ')
+  APP_SELECTED=""
+  [ -n "$ROOT_PID" ] && APP_SELECTED=$(candidates "" "$ROOT_PID")
+  if [ -n "${MEMBER_PIDS// /}" ]; then
+    REST=$(candidates "" "$MEMBER_PIDS")
+    [ -n "$REST" ] && APP_SELECTED="${APP_SELECTED:+$APP_SELECTED
+}$REST"
+  fi
+fi
+
 if [ "$LIST" -eq 1 ]; then
-  candidates "${MATCH:-$QUERY}"
+  if [ -n "$PORT" ]; then
+    PORT_PIDS=$(port_pids "$PORT")
+    [ -n "$PORT_PIDS" ] && candidates "" "$PORT_PIDS"
+  elif [ -n "$APP" ]; then
+    [ -n "${APP_SELECTED:-}" ] && echo "$APP_SELECTED"
+  else
+    candidates "${MATCH:-$QUERY}"
+  fi
   exit 0
 fi
 
-if [ -n "$MATCH" ]; then
+if [ -n "$PORT" ]; then
+  PORT_PIDS=$(port_pids "$PORT")
+  [ -z "$PORT_PIDS" ] && {
+    echo "fkill: no killable listener on port $PORT (nothing listening, or owned by another user)" >&2
+    exit 1
+  }
+  SELECTED=$(candidates "" "$PORT_PIDS")
+  [ -z "$SELECTED" ] && {
+    echo "fkill: listener on port $PORT is excluded (fkill never targets itself or herdr)" >&2
+    exit 1
+  }
+elif [ -n "$APP" ]; then
+  SELECTED="${APP_SELECTED:-}"
+  [ -z "$SELECTED" ] && { echo "fkill: no processes for app: $APP" >&2; exit 1; }
+  N=$(echo "$SELECTED" | wc -l | tr -d ' ')
+  # A whole app is inherently many processes: a visible victim list plus one
+  # confirmation replaces the numeric blast-radius guard here.
+  if [ -n "$ROOT_PID" ]; then
+    ROOT_COMM=$(ps -p "$ROOT_PID" -o comm= 2>/dev/null) || ROOT_COMM=""
+    case "$ROOT_COMM" in
+      /System/*) echo "fkill: note — $APP is a system app; launchd will restart it" >&2 ;;
+    esac
+  fi
+  if [ "$FORCE" -eq 0 ]; then
+    if [ ! -t 0 ]; then
+      echo "fkill: --app needs a terminal to confirm (or pass --force)" >&2; exit 1
+    fi
+    echo "fkill: --app $APP resolves to $N process(es)${ROOT_PID:+ (root first)}:"
+    while read -r mem pid cmd; do
+      if [ "$pid" = "${ROOT_PID:-}" ]; then
+        printf '  root → %-6s %s\n' "$pid" "$cmd"
+      else
+        printf '         %-6s %s\n' "$pid" "$cmd"
+      fi
+    done <<< "$SELECTED"
+    read -r -p "kill all $N with SIG$SIG? [y/N] " ANSWER
+    case "$ANSWER" in
+      y|Y|yes|YES) ;;
+      *) echo "fkill: aborted"; exit 1 ;;
+    esac
+  fi
+elif [ -n "$MATCH" ]; then
   SELECTED=$(candidates "$MATCH")
   [ -z "$SELECTED" ] && { echo "fkill: no candidates match: $MATCH" >&2; exit 1; }
-  N=$(echo "$SELECTED" | wc -l | tr -d ' ')
-  if [ "$N" -gt 5 ] && [ "$FORCE" -eq 0 ]; then
-    echo "fkill: $N processes match '$MATCH' — refusing to kill more than 5 without --force:" >&2
-    echo "$SELECTED" >&2
-    exit 1
-  fi
 else
   SELECTED=$(candidates | fzf --multi \
     --header="MEM(MB)   PID    COMMAND   —   tab: multi-select, enter: kill (SIG$SIG)" \
@@ -86,6 +225,36 @@ else
     --preview-window=down,4) || true
   [ -z "$SELECTED" ] && { echo "fkill: nothing selected"; exit 0; }
 fi
+
+# Blast-radius guard for the non-interactive selectors (interactive fzf is its
+# own confirmation; the user picked each row).
+if [ -n "$PORT" ] || [ -n "$MATCH" ]; then
+  N=$(echo "$SELECTED" | wc -l | tr -d ' ')
+  if [ "$N" -gt 5 ] && [ "$FORCE" -eq 0 ]; then
+    echo "fkill: $N processes selected — refusing to kill more than 5 without --force:" >&2
+    echo "$SELECTED" >&2
+    exit 1
+  fi
+fi
+
+# Death check: gone (ps exits nonzero / empty) or zombie (state starts with Z —
+# kill -0 succeeds on zombies, so it is the wrong liveness test).
+is_dead() {
+  local st
+  st=$(ps -p "$1" -o state= 2>/dev/null | tr -d '[:space:]') || return 0
+  [ -z "$st" ] && return 0
+  case "$st" in Z*) return 0 ;; *) return 1 ;; esac
+}
+
+# Poll up to $WAIT seconds (0.1s steps) for the PID to die.
+wait_dead() {
+  local i=0 n=$((WAIT * 10))
+  while [ "$i" -lt "$n" ]; do
+    is_dead "$1" && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  is_dead "$1"
+}
 
 FAILED=0
 while read -r mem pid cmd; do
@@ -97,10 +266,24 @@ while read -r mem pid cmd; do
     *) echo "fkill: skipping $pid — command changed since selection (now: ${NOW:-gone})" >&2
        continue ;;
   esac
-  if kill "-$SIG" "$pid" 2>/dev/null; then
-    echo "killed (SIG$SIG) $pid  $cmd"
-  else
+  if ! kill "-$SIG" "$pid" 2>/dev/null; then
     echo "fkill: failed to signal $pid  $cmd" >&2
+    FAILED=1
+    continue
+  fi
+  # Honest reporting: "killed" only once the process is actually gone.
+  if wait_dead "$pid"; then
+    echo "killed (SIG$SIG) $pid  $cmd"
+  elif [ "$ESCALATE" -eq 1 ] && [ "$SIG" != KILL ]; then
+    kill -KILL "$pid" 2>/dev/null || true
+    if wait_dead "$pid"; then
+      echo "killed (SIGKILL after SIG$SIG) $pid  $cmd"
+    else
+      echo "fkill: $pid still running after SIGKILL  $cmd" >&2
+      FAILED=1
+    fi
+  else
+    echo "fkill: $pid still running after SIG$SIG (use --escalate or -9)  $cmd" >&2
     FAILED=1
   fi
 done <<< "$SELECTED"

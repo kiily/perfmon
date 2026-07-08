@@ -71,6 +71,60 @@ check "fkill excludes own shell"     fails grep -qE "^\s*[0-9]+\s+$$\s" <<<"$LIS
 HERDR_LISTED=$(fkill --list --match "herdr" 2>&1)
 check "fkill excludes herdr"         test -z "$HERDR_LISTED"
 
+# --- fkill: death verification + --escalate --------------------------------
+# A TERM-ignoring target must produce "still running" + exit 2, then die
+# under --escalate. Marker makes it uniquely matchable and PID-unique.
+IGN="perfmon-ignoreterm-$$"
+IGNPID=$(python3 -c "import subprocess as s; print(s.Popen(['bash','-c','trap \"\" TERM; while :; do sleep 5; done','$IGN'], start_new_session=True, stdout=s.DEVNULL, stderr=s.DEVNULL).pid)")
+cleanup_ign() { kill -9 "$IGNPID" 2>/dev/null; return 0; }
+ign_listed() { fkill --list --match "$IGN" | grep -q "$IGN"; }
+poll ign_listed >/dev/null
+check "fkill survivor exits 2"       bash -c "fkill --wait 1 --match '$IGN'; [ \$? -eq 2 ]"
+check "fkill survivor still alive"   kill -0 "$IGNPID"
+check "fkill --escalate kills it"    fkill --wait 1 --escalate --match "$IGN"
+check "fkill escalated target dead"  poll bash -c "! kill -0 $IGNPID 2>/dev/null"
+cleanup_ign
+check "fkill --wait 0 rejected"      fails fkill --wait 0 --list
+check "fkill --wait missing value"   fails fkill --wait
+
+# --- fkill: --port ----------------------------------------------------------
+TPORT=$((20000 + $$ % 20000))
+check "fkill --port free exits 1"    fails fkill --port "$TPORT"
+LPID=$(python3 -c "import subprocess as s; print(s.Popen(['python3','-m','http.server','$TPORT','--bind','127.0.0.1'], start_new_session=True, stdout=s.DEVNULL, stderr=s.DEVNULL).pid)")
+cleanup_l() { kill -9 "$LPID" 2>/dev/null; return 0; }
+port_listed() { fkill --list --port "$TPORT" | grep -qE "^\s*[0-9]+\s+$LPID\s"; }
+check "fkill --port list shows it"   poll port_listed
+check "fkill --port list kills nothing" kill -0 "$LPID"
+check "fkill --port kills listener"  fkill --port "$TPORT"
+check "fkill --port target dead"     poll bash -c "! kill -0 $LPID 2>/dev/null"
+cleanup_l
+check "fkill --port range check"     fails fkill --port 99999
+check "fkill selector exclusivity"   fails fkill --port "$TPORT" --match x
+
+# --- fkill: --app -----------------------------------------------------------
+# Fake bundle: argv[0] carries the bundle path (executable= override), so the
+# resolver sees a root (Contents/MacOS), a helper (Resources), and a pathless
+# child that only the transitive-PPID sweep can find.
+BAPP="Smoke $$ App"    # spaces on purpose — bundle names have them
+BDIR="${TMPDIR:-/tmp}/perfmon-smoke-$$/$BAPP.app/Contents"
+mkdir -p "$BDIR/MacOS" "$BDIR/Resources"
+BROOT=$(python3 -c "import subprocess as s; print(s.Popen(['$BDIR/MacOS/SmokeRoot','-c','sleep 600 & wait'], executable='/bin/bash', start_new_session=True, stdout=s.DEVNULL, stderr=s.DEVNULL).pid)")
+BHELP=$(python3 -c "import subprocess as s; print(s.Popen(['$BDIR/Resources/smokehelper','600'], executable='/bin/sleep', start_new_session=True, stdout=s.DEVNULL, stderr=s.DEVNULL).pid)")
+cleanup_b() { kill -9 "$BROOT" "$BHELP" 2>/dev/null; rm -rf "${TMPDIR:-/tmp}/perfmon-smoke-$$"; return 0; }
+app_resolved() { [ "$(fkill --list --app "$BAPP" | wc -l | tr -d ' ')" -ge 3 ]; }
+check "fkill --app resolves 3 procs"  poll app_resolved   # root + helper + pathless child
+check "fkill --app root listed first" bash -c "fkill --list --app '$BAPP' | head -1 | grep -qE '^\s*[0-9]+\s+$BROOT\s'"
+check "fkill --app partial no match"  fails bash -c "fkill --list --app 'Smoke $$' | grep -q ."
+check "fkill --app non-tty refuses"   fails bash -c "fkill --app '$BAPP' </dev/null"
+check "fkill --app refusal kills nothing" kill -0 "$BROOT"
+BCHILD=$(pgrep -P "$BROOT" || true)
+check "fkill --app --force kills all" fkill --app "$BAPP" --force
+check "fkill --app root dead"         poll bash -c "! kill -0 $BROOT 2>/dev/null"
+check "fkill --app helper dead"       poll bash -c "! kill -0 $BHELP 2>/dev/null"
+[ -n "$BCHILD" ] && check "fkill --app child swept" poll bash -c "! kill -0 $BCHILD 2>/dev/null"
+check "fkill --app unknown exits 1"   fails fkill --app "no-such-app-$$" --force
+cleanup_b
+
 # --- perfmon --------------------------------------------------------------
 check "perfmon --doctor"       perfmon --doctor
 if [ "${HERDR_ENV:-}" = "1" ]; then
