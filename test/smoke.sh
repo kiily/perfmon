@@ -23,7 +23,7 @@ check "memtop --raw has PIDs"  grep -qE '^\s+[0-9.]+\s+[0-9.]+%\s+[0-9]+' <<<"$O
 # Dummy target must live in its own process group (fkill rightly refuses to
 # target its own group, which a same-shell background job would share).
 TAG=$((RANDOM % 10))
-DUMMY=$(python3 -c "import subprocess; print(subprocess.Popen(['sleep','600$TAG'], start_new_session=True).pid)")
+DUMMY=$(python3 -c "import subprocess as s; print(s.Popen(['sleep','600$TAG'], start_new_session=True, stdout=s.DEVNULL, stderr=s.DEVNULL).pid)")
 sleep 0.3
 KILL_OUT=$(fkill --match "sleep 600$TAG$" 2>&1)
 sleep 0.3
