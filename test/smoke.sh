@@ -127,6 +127,8 @@ cleanup_b
 
 # --- perfmon --------------------------------------------------------------
 check "perfmon --doctor"       perfmon --doctor
+check "perfmon --guide"        bash -c "perfmon --guide | grep -q 'already in use'"
+check "perfmon --cheats"       bash -c "perfmon --cheats | grep -q 'fkill --port'"
 if [ "${HERDR_ENV:-}" = "1" ]; then
   perfmon --ensure >/dev/null 2>&1
   perfmon --ensure >/dev/null 2>&1

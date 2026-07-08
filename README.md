@@ -25,6 +25,7 @@ All available in every shell once installed:
 | `perfmon --ensure` | Idempotent create, never steals focus (used by auto-launch). |
 | `perfmon --doctor` | Check dependencies (btop, fzf, herdr, python3). |
 | `perfmon --cheats` | Print the command cheat sheet. |
+| `perfmon --guide` | Practical how-to guide organized by situation ("port busy", "app gone feral", "it won't die"). |
 
 `fkill` never offers itself, your current shell and its ancestors, or the herdr
 server as targets. Exit codes: 0 = killed and verified dead, 1 = nothing

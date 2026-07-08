@@ -4,6 +4,7 @@
 #        perfmon --ensure          idempotent + never steals focus (used by auto-launch)
 #        perfmon --doctor          check dependencies
 #        perfmon --cheats          print the command cheat sheet
+#        perfmon --guide           practical how-to guide (common workflows)
 #        perfmon --pressure-watch  memory-pressure loop (internal; loops forever)
 set -eu
 
@@ -42,8 +43,54 @@ case "${1:-}" in
     fkill --list …    preview any selector without killing
     perfmon           rebuild/focus this workspace
     perfmon --doctor  dependency health check
+    perfmon --guide   how-to guide for common situations
 
   btop (left): click a process → t/k to terminate/kill, m sorts by memory
+
+EOF
+    exit 0 ;;
+  --guide)
+    cat <<'EOF'
+
+  perfmon — how to use it, by situation
+  ═════════════════════════════════════
+
+  "My Mac feels slow / fans are spinning"
+    memtop                     who's eating RAM, grouped by app (free% + swap up top)
+    memtop --raw               same, per-process with PIDs
+    memtop --watch             keep it on screen; Ctrl-C to stop
+    If swap is growing or free% is low, pick a victim below.
+
+  "Kill something I can see"
+    fkill                      fuzzy list, biggest first — type to filter,
+                               tab to multi-select, enter to SIGTERM
+    fkill -9 <query>           same but SIGKILL, pre-filtered
+
+  "Port 3000 is already in use"
+    fkill --list --port 3000   see who holds it (kills nothing)
+    fkill --port 3000          kill it
+
+  "Chrome/Slack/etc has gone feral — kill ALL of it"
+    fkill --list --app 'Google Chrome'    preview: root + every helper
+    fkill --app 'Google Chrome'           shows the list, asks once, kills
+                                          root first so helpers don't respawn
+    Use the exact bundle name ('Google Chrome', not 'chrome').
+
+  "Kill by name from a script"
+    fkill --match 'vite'       kills every COMMAND matching the regex
+                               (>5 matches refuses unless --force)
+    fkill --list --match RE    always dry-run first
+
+  "It won't die"
+    Every kill is verified — if a process ignores TERM you'll see
+    'still running' and exit 2. Then:
+    fkill --escalate --match RE    TERM, wait, then SIGKILL
+
+  Safety, always on: fkill never targets itself, your shell and its
+  ancestors, or herdr. Exit codes: 0 killed+verified · 1 no match or
+  refused · 2 kill failed or survived.
+
+  Health check:  perfmon --doctor        Quick reference:  perfmon --cheats
 
 EOF
     exit 0 ;;
@@ -58,7 +105,7 @@ EOF
       memory_pressure 2>/dev/null | grep -E "^(Swapins|Swapouts|Faults|Pageins):" | head -4
       sleep 10
     done ;;
-  -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
   "") ;;
   *) echo "perfmon: unknown option $1" >&2; exit 1 ;;
 esac
