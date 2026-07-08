@@ -1,0 +1,68 @@
+#!/bin/bash
+# memtop — top memory consumers on macOS, helper processes aggregated by responsible app.
+# Usage: memtop [-n N] [--raw] [--watch [SECS]]
+set -eu
+
+LIMIT=15
+RAW=0
+WATCH=0
+INTERVAL=5
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) LIMIT="$2"; shift 2 ;;
+    --raw) RAW=1; shift ;;
+    --watch) WATCH=1; [ "${2:-}" != "" ] && [[ "${2:-}" =~ ^[0-9]+$ ]] && { INTERVAL="$2"; shift; }; shift ;;
+    -h|--help) sed -n '2,3p' "$0"; exit 0 ;;
+    *) echo "memtop: unknown option $1" >&2; exit 1 ;;
+  esac
+done
+
+TOTAL_BYTES=$(sysctl -n hw.memsize)
+
+snapshot() {
+  echo "── memtop  $(date '+%H:%M:%S')  ────────────────────────────────"
+  # Headline: pressure + swap
+  local swap
+  swap=$(sysctl -n vm.swapusage | sed 's/(encrypted)//')
+  local free_pct
+  free_pct=$(memory_pressure -Q 2>/dev/null | awk -F': ' '/percentage/ {print $2}')
+  echo "RAM: $((TOTAL_BYTES / 1073741824)) GB total   free: ${free_pct:-n/a}   swap:${swap}"
+  echo ""
+  if [ "$RAW" = 1 ]; then
+    printf "%8s %7s  %-6s %s\n" "MEM(GB)" "%RAM" "PID" "COMMAND"
+    ps -axo rss=,pid=,comm= | sort -rn | head -n "$LIMIT" | \
+      awk -v total="$TOTAL_BYTES" '{
+        rss=$1; pid=$2; $1=""; $2=""; cmd=substr($0,3);
+        printf "%8.2f %6.1f%%  %-6s %s\n", rss/1048576, (rss*1024/total)*100, pid, cmd
+      }'
+  else
+    printf "%8s %7s %6s  %s\n" "MEM(GB)" "%RAM" "PROCS" "APP"
+    ps -axo rss=,comm= | awk -v total="$TOTAL_BYTES" '
+      {
+        rss=$1; $1=""; cmd=substr($0,2);
+        key=""
+        # Group by the first .app bundle in the path (Chrome Helper → Google Chrome)
+        n=split(cmd, parts, "/")
+        for (i=1; i<=n; i++) if (parts[i] ~ /\.app$/) { key=parts[i]; sub(/\.app$/,"",key); break }
+        if (key == "") {
+          key=parts[n]
+          sub(/ Helper.*$/, "", key)
+          sub(/\.helper.*$/, "", key)
+        }
+        mem[key]+=rss; count[key]++
+      }
+      END {
+        for (k in mem) printf "%.6f\t%d\t%s\n", mem[k]/1048576, count[k], k
+      }' | sort -rn | head -n "$LIMIT" | \
+      awk -F'\t' -v total="$TOTAL_BYTES" '{
+        printf "%8.2f %6.1f%% %6d  %s\n", $1, ($1*1073741824/total)*100, $2, $3
+      }'
+  fi
+}
+
+if [ "$WATCH" = 1 ]; then
+  while :; do clear; snapshot; sleep "$INTERVAL"; done
+else
+  snapshot
+fi

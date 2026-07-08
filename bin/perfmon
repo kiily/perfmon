@@ -1,0 +1,134 @@
+#!/bin/bash
+# perfmon — create or focus the "PERF MONITORING" herdr workspace.
+# Usage: perfmon              create the workspace or focus it if it exists
+#        perfmon --ensure     idempotent + never steals focus (used by auto-launch)
+#        perfmon --doctor     check dependencies
+set -eu
+
+LABEL="PERF MONITORING"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+BIN_DIR="$(dirname "$SELF")"
+MODE="focus"
+
+case "${1:-}" in
+  --ensure) MODE="ensure" ;;
+  --doctor)
+    ok=1
+    for dep in btop fzf herdr python3; do
+      if command -v "$dep" >/dev/null; then
+        echo "ok      $dep ($(command -v "$dep"))"
+      else
+        echo "MISSING $dep — install with: brew install $dep"; ok=0
+      fi
+    done
+    [ "${HERDR_ENV:-}" = "1" ] && echo "ok      running inside herdr" || echo "note    not inside herdr (workspace features unavailable)"
+    [ "$ok" = 1 ] && echo "doctor: all good" || exit 1
+    exit 0 ;;
+  --cheats)
+    cat <<'EOF'
+
+  PERF MONITORING — commands (available in any shell)
+
+    memtop            what's eating memory, grouped by app
+    memtop --raw      ungrouped, per-process with PIDs
+    memtop --watch    live-refreshing view
+    fkill             fuzzy-pick process(es) to kill  [tab = multi-select]
+    fkill -9 vite     …with SIGKILL, pre-filtered to "vite"
+    fkill --match RE  non-interactive kill by regex
+    perfmon           rebuild/focus this workspace
+    perfmon --doctor  dependency health check
+
+  btop (left): click a process → t/k to terminate/kill, m sorts by memory
+
+EOF
+    exit 0 ;;
+  --pressure-watch)
+    while :; do
+      clear
+      echo "── memory pressure  $(date '+%H:%M:%S') ──"
+      memory_pressure -Q 2>/dev/null | grep -Ei "level|percentage"
+      echo ""
+      echo "swap: $(sysctl -n vm.swapusage | sed 's/(encrypted)//')"
+      echo ""
+      memory_pressure 2>/dev/null | grep -E "^(Swapins|Swapouts|Faults|Pageins):" | head -4
+      sleep 10
+    done ;;
+  -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+  "") ;;
+  *) echo "perfmon: unknown option $1" >&2; exit 1 ;;
+esac
+
+if [ "${HERDR_ENV:-}" != "1" ]; then
+  echo "perfmon: not inside herdr (HERDR_ENV != 1); nothing to do" >&2
+  exit 1
+fi
+
+json() { python3 -c "import sys,json;$1" 2>/dev/null; }
+
+find_workspace() {
+  herdr workspace list | json "
+ws=json.load(sys.stdin)['result']['workspaces']
+m=[w for w in ws if w.get('label')=='$LABEL']
+print(m[0]['workspace_id'] if m else '')"
+}
+
+# ── race-safe check-and-create (multiple pane shells start at attach) ──────
+LOCK="${TMPDIR:-/tmp}/perfmon.lock.d"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  # stale lock (>120s) gets cleaned up; otherwise another instance is building
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
+    rmdir "$LOCK" 2>/dev/null || true
+    mkdir "$LOCK" 2>/dev/null || exit 0
+  else
+    [ "$MODE" = "ensure" ] && exit 0
+    # focus mode: wait briefly for the builder, then just try to focus
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      WS_ID=$(find_workspace)
+      [ -n "$WS_ID" ] && { herdr workspace focus "$WS_ID" >/dev/null; exit 0; }
+      sleep 1
+    done
+    exit 0
+  fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+WS_ID=$(find_workspace)
+if [ -n "$WS_ID" ]; then
+  [ "$MODE" = "ensure" ] || herdr workspace focus "$WS_ID" >/dev/null
+  exit 0
+fi
+
+# ── build ───────────────────────────────────────────────────────────────────
+# btop: default to memory sorting if the user has no config yet
+BTOP_CONF="$HOME/.config/btop/btop.conf"
+if [ ! -f "$BTOP_CONF" ]; then
+  mkdir -p "$(dirname "$BTOP_CONF")"
+  printf 'proc_sorting = "memory"\nupdate_ms = 2000\n' > "$BTOP_CONF"
+fi
+
+FOCUS_FLAG=""
+[ "$MODE" = "ensure" ] && FOCUS_FLAG="--no-focus"
+
+CREATE=$(herdr workspace create --cwd "$HOME" --label "$LABEL" $FOCUS_FLAG)
+WS_ID=$(echo "$CREATE" | json "r=json.load(sys.stdin)['result'];w=r['workspace'];print(w['workspace_id'] if isinstance(w,dict) else w)")
+TAB1=$(echo "$CREATE"  | json "r=json.load(sys.stdin)['result'];t=r['tab'];print(t['tab_id'] if isinstance(t,dict) else t)")
+PANE1=$(echo "$CREATE" | json "r=json.load(sys.stdin)['result'];p=r['root_pane'];print(p['pane_id'] if isinstance(p,dict) else p)")
+
+new_pane_id() { json "print(json.load(sys.stdin)['result']['pane']['pane_id'])"; }
+
+# Tab 1: Overview — btop (left ~70%) + command shell with cheat sheet (right)
+herdr tab rename "$TAB1" "Overview" >/dev/null 2>&1 || true
+CHEAT_PANE=$(herdr pane split "$PANE1" --direction right --ratio 0.7 --no-focus | new_pane_id)
+herdr pane run "$PANE1" "btop"
+herdr pane run "$CHEAT_PANE" "clear; '$SELF' --cheats"
+
+# Tab 2: Memory — memtop watch (top) + vm_stat / pressure+swap (bottom)
+TAB2_JSON=$(herdr tab create --workspace "$WS_ID" --label "Memory" --no-focus)
+PANE2=$(echo "$TAB2_JSON" | json "r=json.load(sys.stdin)['result'];p=r['root_pane'];print(p['pane_id'] if isinstance(p,dict) else p)")
+VMSTAT_PANE=$(herdr pane split "$PANE2" --direction down --ratio 0.55 --no-focus | new_pane_id)
+PRESSURE_PANE=$(herdr pane split "$VMSTAT_PANE" --direction right --ratio 0.5 --no-focus | new_pane_id)
+herdr pane run "$PANE2" "'$BIN_DIR/memtop' --watch 5"
+herdr pane run "$VMSTAT_PANE" "vm_stat 10"
+herdr pane run "$PRESSURE_PANE" "'$SELF' --pressure-watch"
+
+echo "perfmon: workspace '$LABEL' created ($WS_ID)"
