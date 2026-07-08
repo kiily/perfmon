@@ -125,6 +125,17 @@ Related latent traps in the same family: shell variables interpolated into pytho
 4. `rmdir`/`rm` of a lock followed by re-acquisition, or any `trap '... rm ...' EXIT` whose path isn't provably owned by `$$`.
 5. Shell variables spliced into `-c` program text for another interpreter; `>/dev/null 2>&1 &` on anything run at startup.
 
+## Implementation learnings (from resolving the todos, 2026-07-08)
+
+All nine findings were fixed in commit `a1626fe`; the smoke suite grew from 11 to 18 checks. Gotchas discovered during implementation, worth knowing next time:
+
+1. **BSD awk mangles backslashes in `-v` variables** — passing a user regex via `awk -v re="$MATCH"` corrupts patterns like `time\.sleep\(9999\)`. Pass it through the environment instead: `MATCH_RE="$re" awk '... ENVIRON["MATCH_RE"] ...'`.
+2. **A piped `while` loop runs in a subshell** — `echo "$SELECTED" | while ...; do FAILED=1; done` loses the flag. Use `while ...; done <<< "$SELECTED"` so exit-code accounting survives the loop.
+3. **`$0` under zsh `source` is unreliable** — it depends on `FUNCTION_ARGZERO`/`POSIX_ARGZERO`. The robust idiom for "directory of the currently-sourced file" is `${${(%):-%N}:A:h}` (prompt-expansion `%N`).
+4. **Fixing match semantics changes what tests are safe** — the old smoke check `fkill --match herdr` relied on the exclusion list to be a no-op; under corrected command-column matching it would genuinely attempt the kill. Exclusion checks belong in `--list` mode, which is also the right home for "candidate list must not contain X" assertions generally.
+5. **Concurrency fixes deserve an isolated harness** — the lock takeover was validated with a scratch script running 6 simultaneous contenders on a stale lock (exactly one winner; a loser's EXIT trap must leave the winner's lock intact). The repo's sequential idempotency smoke check cannot exercise this and shouldn't pretend to.
+6. **Keep defensive parsing until the API shape is verified** — the dict-or-string fallback in the herdr create-response parser was retained (as one lambda in a single parse) because verifying the real shape would have required a mutating call; collapsing three parses into one still removed two failure points.
+
 ## Historical context
 
 Commit `c1926c4` (2026-07-08) previously fixed a related, *solved* problem in `test/smoke.sh:26`: the dummy kill target was spawned with `start_new_session=True` (fkill deliberately refuses its own process group, so a same-shell background job would be invisible to it) but inherited the test's stdout/stderr, keeping the `$(...)` PID-capture pipe open until the sleeper died. Adding `stdout=DEVNULL, stderr=DEVNULL` fully detached it. The pgid-exclusion logic itself is sound and unrelated to the match-scope defect above.
