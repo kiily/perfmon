@@ -16,10 +16,12 @@ All available in every shell once installed:
 | `memtop -n N` | Show N rows (default 15). |
 | `fkill [query]` | Memory-sorted process list in fzf. Type to filter, `tab` to multi-select, `enter` to SIGTERM. Optional query pre-fills the filter. |
 | `fkill -9 [query]` | Same, but SIGKILL. |
-| `fkill --match REGEX` | Non-interactive: kill everything matching the regex (still respects safety exclusions). |
+| `fkill --match REGEX` | Non-interactive: kill everything whose **command** matches the regex (case-insensitive, never matches PID/MEM columns; still respects safety exclusions). More than 5 matches requires `--force`. Exits 1 if nothing matched, 2 if a kill failed. |
+| `fkill --list [--match REGEX \| query]` | Print the candidate list (optionally filtered) without killing anything. |
 | `perfmon` | Create the PERF MONITORING herdr workspace, or focus it if it exists. |
 | `perfmon --ensure` | Idempotent create, never steals focus (used by auto-launch). |
 | `perfmon --doctor` | Check dependencies (btop, fzf, herdr, python3). |
+| `perfmon --cheats` | Print the command cheat sheet. |
 
 `fkill` never offers itself, your current shell and its ancestors, or the herdr
 server as targets.

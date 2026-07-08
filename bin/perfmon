@@ -1,8 +1,10 @@
 #!/bin/bash
 # perfmon — create or focus the "PERF MONITORING" herdr workspace.
-# Usage: perfmon              create the workspace or focus it if it exists
-#        perfmon --ensure     idempotent + never steals focus (used by auto-launch)
-#        perfmon --doctor     check dependencies
+# Usage: perfmon                   create the workspace or focus it if it exists
+#        perfmon --ensure          idempotent + never steals focus (used by auto-launch)
+#        perfmon --doctor          check dependencies
+#        perfmon --cheats          print the command cheat sheet
+#        perfmon --pressure-watch  memory-pressure loop (internal; loops forever)
 set -eu
 
 LABEL="PERF MONITORING"
@@ -53,7 +55,7 @@ EOF
       memory_pressure 2>/dev/null | grep -E "^(Swapins|Swapouts|Faults|Pageins):" | head -4
       sleep 10
     done ;;
-  -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
   "") ;;
   *) echo "perfmon: unknown option $1" >&2; exit 1 ;;
 esac
@@ -63,36 +65,46 @@ if [ "${HERDR_ENV:-}" != "1" ]; then
   exit 1
 fi
 
-json() { python3 -c "import sys,json;$1" 2>/dev/null; }
+json() { python3 -c "import sys,json,os;$1"; }
 
 find_workspace() {
-  herdr workspace list | json "
+  # empty-on-error is intentional here: callers treat "" as not-found
+  herdr workspace list 2>/dev/null | LABEL="$LABEL" json "
 ws=json.load(sys.stdin)['result']['workspaces']
-m=[w for w in ws if w.get('label')=='$LABEL']
-print(m[0]['workspace_id'] if m else '')"
+m=[w for w in ws if w.get('label')==os.environ['LABEL']]
+print(m[0]['workspace_id'] if m else '')" 2>/dev/null
 }
 
 # ── race-safe check-and-create (multiple pane shells start at attach) ──────
-LOCK="${TMPDIR:-/tmp}/perfmon.lock.d"
-if ! mkdir "$LOCK" 2>/dev/null; then
-  # stale lock (>120s) gets cleaned up; otherwise another instance is building
-  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
-    rmdir "$LOCK" 2>/dev/null || true
-    mkdir "$LOCK" 2>/dev/null || exit 0
-  else
-    [ "$MODE" = "ensure" ] && exit 0
-    # focus mode: wait briefly for the builder, then just try to focus
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      WS_ID=$(find_workspace)
-      [ -n "$WS_ID" ] && { herdr workspace focus "$WS_ID" >/dev/null; exit 0; }
-      sleep 1
-    done
-    exit 0
-  fi
-fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+LOCK="${TMPDIR:-/tmp}/perfmon.$UID.lock.d"
+LOCK_OWNED=0
+trap '[ "$LOCK_OWNED" = 1 ] && rmdir "$LOCK" 2>/dev/null || true' EXIT
 
-WS_ID=$(find_workspace)
+acquire_lock() {
+  mkdir "$LOCK" 2>/dev/null && { LOCK_OWNED=1; return 0; }
+  # stale lock (>120s): atomic takeover — the mv has exactly one winner,
+  # and mkdir stays the sole acquisition arbiter
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +2 2>/dev/null)" ]; then
+    if mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then
+      rmdir "$LOCK.stale.$$" 2>/dev/null || true
+    fi
+    mkdir "$LOCK" 2>/dev/null && { LOCK_OWNED=1; return 0; }
+  fi
+  return 1
+}
+
+if ! acquire_lock; then
+  [ "$MODE" = "ensure" ] && exit 0
+  # focus mode: wait briefly for the builder, then just try to focus
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    WS_ID=$(find_workspace) || WS_ID=""
+    [ -n "$WS_ID" ] && { herdr workspace focus "$WS_ID" >/dev/null; exit 0; }
+    sleep 1
+  done
+  exit 0
+fi
+
+WS_ID=$(find_workspace) || WS_ID=""
 if [ -n "$WS_ID" ]; then
   [ "$MODE" = "ensure" ] || herdr workspace focus "$WS_ID" >/dev/null
   exit 0
@@ -110,9 +122,17 @@ FOCUS_FLAG=""
 [ "$MODE" = "ensure" ] && FOCUS_FLAG="--no-focus"
 
 CREATE=$(herdr workspace create --cwd "$HOME" --label "$LABEL" $FOCUS_FLAG)
-WS_ID=$(echo "$CREATE" | json "r=json.load(sys.stdin)['result'];w=r['workspace'];print(w['workspace_id'] if isinstance(w,dict) else w)")
-TAB1=$(echo "$CREATE"  | json "r=json.load(sys.stdin)['result'];t=r['tab'];print(t['tab_id'] if isinstance(t,dict) else t)")
-PANE1=$(echo "$CREATE" | json "r=json.load(sys.stdin)['result'];p=r['root_pane'];print(p['pane_id'] if isinstance(p,dict) else p)")
+{ read -r WS_ID; read -r TAB1; read -r PANE1; } < <(printf '%s' "$CREATE" | python3 -c '
+import sys, json
+r = json.load(sys.stdin)["result"]
+i = lambda v, k: v[k] if isinstance(v, dict) else v
+print(i(r["workspace"], "workspace_id")); print(i(r["tab"], "tab_id")); print(i(r["root_pane"], "pane_id"))
+')
+[ -n "$WS_ID" ] && [ -n "$PANE1" ] || { echo "perfmon: unexpected create response: $CREATE" >&2; exit 1; }
+
+# quote paths as data for the pane command strings (survives quotes/spaces)
+printf -v SELF_Q '%q' "$SELF"
+printf -v MEMTOP_Q '%q' "$BIN_DIR/memtop"
 
 new_pane_id() { json "print(json.load(sys.stdin)['result']['pane']['pane_id'])"; }
 
@@ -120,15 +140,15 @@ new_pane_id() { json "print(json.load(sys.stdin)['result']['pane']['pane_id'])";
 herdr tab rename "$TAB1" "Overview" >/dev/null 2>&1 || true
 CHEAT_PANE=$(herdr pane split "$PANE1" --direction right --ratio 0.7 --no-focus | new_pane_id)
 herdr pane run "$PANE1" "btop"
-herdr pane run "$CHEAT_PANE" "clear; '$SELF' --cheats"
+herdr pane run "$CHEAT_PANE" "clear; $SELF_Q --cheats"
 
 # Tab 2: Memory — memtop watch (top) + vm_stat / pressure+swap (bottom)
 TAB2_JSON=$(herdr tab create --workspace "$WS_ID" --label "Memory" --no-focus)
 PANE2=$(echo "$TAB2_JSON" | json "r=json.load(sys.stdin)['result'];p=r['root_pane'];print(p['pane_id'] if isinstance(p,dict) else p)")
 VMSTAT_PANE=$(herdr pane split "$PANE2" --direction down --ratio 0.55 --no-focus | new_pane_id)
 PRESSURE_PANE=$(herdr pane split "$VMSTAT_PANE" --direction right --ratio 0.5 --no-focus | new_pane_id)
-herdr pane run "$PANE2" "'$BIN_DIR/memtop' --watch 5"
+herdr pane run "$PANE2" "$MEMTOP_Q --watch 5"
 herdr pane run "$VMSTAT_PANE" "vm_stat 10"
-herdr pane run "$PRESSURE_PANE" "'$SELF' --pressure-watch"
+herdr pane run "$PRESSURE_PANE" "$SELF_Q --pressure-watch"
 
 echo "perfmon: workspace '$LABEL' created ($WS_ID)"

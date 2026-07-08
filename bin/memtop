@@ -10,9 +10,20 @@ INTERVAL=5
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    -n) LIMIT="$2"; shift 2 ;;
+    -n)
+      [ $# -ge 2 ] || { echo "memtop: missing value for -n" >&2; exit 1; }
+      LIMIT="$2"; shift 2 ;;
     --raw) RAW=1; shift ;;
-    --watch) WATCH=1; [ "${2:-}" != "" ] && [[ "${2:-}" =~ ^[0-9]+$ ]] && { INTERVAL="$2"; shift; }; shift ;;
+    --watch)
+      WATCH=1
+      if [[ "${2:-}" =~ ^[1-9][0-9]*$ ]]; then
+        INTERVAL="$2"
+        shift
+      elif [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        echo "memtop: --watch interval must be a positive integer" >&2
+        exit 1
+      fi
+      shift ;;
     -h|--help) sed -n '2,3p' "$0"; exit 0 ;;
     *) echo "memtop: unknown option $1" >&2; exit 1 ;;
   esac
