@@ -4,7 +4,7 @@
 #        perfmon --ensure          idempotent + never steals focus (used by auto-launch)
 #        perfmon --doctor          check dependencies
 #        perfmon --cheats          print the command cheat sheet
-#        perfmon --guide           practical how-to guide (common workflows)
+#        perfmon --guide           browsable situation guide (overlay; plain when piped)
 #        perfmon --pressure-watch  memory-pressure loop (internal; loops forever)
 set -eu
 
@@ -43,56 +43,125 @@ case "${1:-}" in
     fkill --list …    preview any selector without killing
     perfmon           rebuild/focus this workspace
     perfmon --doctor  dependency health check
-    perfmon --guide   how-to guide for common situations
+    perfmon --guide   situation guide (browsable overlay)
 
   btop (left): click a process → t/k to terminate/kill, m sorts by memory
 
 EOF
     exit 0 ;;
-  --guide)
-    cat <<'EOF'
+  --guide-section)
+    # internal: one compact guide card (the --guide overlay's preview page).
+    # Colors only when asked for (fzf preview is not a tty but renders ANSI).
+    if [ "${PERFMON_COLOR:-}" = 1 ]; then
+      B=$'\e[1m'; D=$'\e[2m'; C=$'\e[36m'; Y=$'\e[33m'; R=$'\e[0m'
+    else
+      B=""; D=""; C=""; Y=""; R=""
+    fi
+    case "${2:-}" in
+      1*) cat <<EOF
 
-  perfmon — how to use it, by situation
-  ═════════════════════════════════════
+ ${B}Mac feels slow · fans spinning${R}
+ ${D}──────────────────────────────${R}
+  ${C}memtop${R}          who eats RAM, by app
+  ${C}memtop --raw${R}    per-process, PIDs
+  ${C}memtop --watch${R}  live view · ^C stops
 
-  "My Mac feels slow / fans are spinning"
-    memtop                     who's eating RAM, grouped by app (free% + swap up top)
-    memtop --raw               same, per-process with PIDs
-    memtop --watch             keep it on screen; Ctrl-C to stop
-    If swap is growing or free% is low, pick a victim below.
-
-  "Kill something I can see"
-    fkill                      fuzzy list, biggest first — type to filter,
-                               tab to multi-select, enter to SIGTERM
-    fkill -9 <query>           same but SIGKILL, pre-filtered
-
-  "Port 3000 is already in use"
-    fkill --list --port 3000   see who holds it (kills nothing)
-    fkill --port 3000          kill it
-
-  "Chrome/Slack/etc has gone feral — kill ALL of it"
-    fkill --list --app 'Google Chrome'    preview: root + every helper
-    fkill --app 'Google Chrome'           shows the list, asks once, kills
-                                          root first so helpers don't respawn
-    Use the exact bundle name ('Google Chrome', not 'chrome').
-
-  "Kill by name from a script"
-    fkill --match 'vite'       kills every COMMAND matching the regex
-                               (>5 matches refuses unless --force)
-    fkill --list --match RE    always dry-run first
-
-  "It won't die"
-    Every kill is verified — if a process ignores TERM you'll see
-    'still running' and exit 2. Then:
-    fkill --escalate --match RE    TERM, wait, then SIGKILL
-
-  Safety, always on: fkill never targets itself, your shell and its
-  ancestors, or herdr. Exit codes: 0 killed+verified · 1 no match or
-  refused · 2 kill failed or survived.
-
-  Health check:  perfmon --doctor        Quick reference:  perfmon --cheats
-
+ ${D}top line = free % and swap.
+ swap growing → pick a victim.${R}
 EOF
+      ;;
+      2*) cat <<EOF
+
+ ${B}Kill something you can see${R}
+ ${D}──────────────────────────────${R}
+  ${C}fkill${R}           fuzzy pick, biggest
+                  first · tab = multi
+                  enter = SIGTERM
+  ${C}fkill -9 vite${R}   SIGKILL, pre-filtered
+EOF
+      ;;
+      3*) cat <<EOF
+
+ ${B}Port already in use${R}
+ ${D}──────────────────────────────${R}
+  ${C}fkill --list --port 3000${R}
+                  who holds it
+  ${C}fkill --port 3000${R}
+                  kill it
+
+ ${D}exit 1 = nothing was listening${R}
+EOF
+      ;;
+      4*) cat <<EOF
+
+ ${B}Kill a whole app${R}
+ ${D}──────────────────────────────${R}
+  ${C}fkill --list --app 'Google Chrome'${R}
+  ${C}fkill --app 'Google Chrome'${R}
+
+ shows every helper, asks once,
+ kills root first so helpers
+ don't respawn.
+
+ ${D}exact name: 'Google Chrome',
+ not 'chrome'.${R}
+EOF
+      ;;
+      5*) cat <<EOF
+
+ ${B}Kill from a script${R}
+ ${D}──────────────────────────────${R}
+  ${C}fkill --match 'vite'${R}
+                  regex on COMMAND only
+
+ ${D}>5 matches refuses without
+ --force · dry-run with --list${R}
+EOF
+      ;;
+      6*) cat <<EOF
+
+ ${B}It won't die${R}
+ ${D}──────────────────────────────${R}
+ kills are verified — a survivor
+ prints 'still running', exit 2.
+
+  ${C}fkill --escalate --match RE${R}
+                  TERM → wait → KILL
+EOF
+      ;;
+      7*) cat <<EOF
+
+ ${B}Safety & exit codes${R}
+ ${D}──────────────────────────────${R}
+ never targets: itself · your
+ shell · its ancestors · herdr
+
+  ${Y}0${R}  killed + verified dead
+  ${Y}1${R}  no match / refused
+  ${Y}2${R}  kill failed / survived
+EOF
+      ;;
+    esac
+    exit 0 ;;
+  --guide)
+    TOPICS='1 · slow Mac, spinning fans
+2 · kill something visible
+3 · port already in use
+4 · kill a whole app
+5 · kill from a script
+6 · it will not die
+7 · safety & exit codes'
+    if [ -t 1 ] && command -v fzf >/dev/null; then
+      # Overlay: fzf takes the alternate screen and restores the pane on exit.
+      printf -v Q '%q' "$SELF"
+      SEL=$(echo "$TOPICS" | fzf --ansi --reverse --border=rounded --info=hidden \
+        --prompt='guide ❯ ' --header='↑↓ browse · enter keeps a card · esc closes' \
+        --preview "PERFMON_COLOR=1 $Q --guide-section {}" \
+        --preview-window=down,75%,wrap) || exit 0
+      PERFMON_COLOR=1 "$SELF" --guide-section "$SEL"
+    else
+      echo "$TOPICS" | while read -r t; do "$SELF" --guide-section "$t"; done
+    fi
     exit 0 ;;
   --pressure-watch)
     while :; do
