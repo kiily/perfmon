@@ -36,7 +36,10 @@ case "${1:-}" in
     memtop --watch    live-refreshing view
     fkill             fuzzy-pick process(es) to kill  [tab = multi-select]
     fkill -9 vite     …with SIGKILL, pre-filtered to "vite"
-    fkill --match RE  non-interactive kill by regex
+    fkill --match RE  non-interactive kill by command regex
+    fkill --port 3000 kill whatever holds a TCP port
+    fkill --app NAME  kill a whole app (root first, confirms)
+    fkill --list …    preview any selector without killing
     perfmon           rebuild/focus this workspace
     perfmon --doctor  dependency health check
 

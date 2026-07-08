@@ -16,15 +16,20 @@ All available in every shell once installed:
 | `memtop -n N` | Show N rows (default 15). |
 | `fkill [query]` | Memory-sorted process list in fzf. Type to filter, `tab` to multi-select, `enter` to SIGTERM. Optional query pre-fills the filter. |
 | `fkill -9 [query]` | Same, but SIGKILL. |
-| `fkill --match REGEX` | Non-interactive: kill everything whose **command** matches the regex (case-insensitive, never matches PID/MEM columns; still respects safety exclusions). More than 5 matches requires `--force`. Exits 1 if nothing matched, 2 if a kill failed. |
-| `fkill --list [--match REGEX \| query]` | Print the candidate list (optionally filtered) without killing anything. |
+| `fkill --match REGEX` | Non-interactive: kill everything whose **command** matches the regex (case-insensitive, never matches PID/MEM columns; still respects safety exclusions). More than 5 matches requires `--force`. |
+| `fkill --port N` | Kill whatever is listening on TCP port N (the "address already in use" fix). Exits 1 if nothing killable listens. |
+| `fkill --app NAME` | Kill a whole app bundle — root process first, then all helpers and their children. Shows the victim list and asks once; `--force` skips the prompt. Exact bundle name ("Google Chrome", not "chrome"). |
+| `fkill --list [--match RE \| --port N \| --app NAME \| query]` | Preview the candidate list without killing anything. |
+| `fkill --escalate` / `--wait SECS` | Every kill is verified — "killed" is printed only when the process is actually gone (poll window default 5s). A TERM-ignoring survivor exits 2; `--escalate` follows up with SIGKILL. |
 | `perfmon` | Create the PERF MONITORING herdr workspace, or focus it if it exists. |
 | `perfmon --ensure` | Idempotent create, never steals focus (used by auto-launch). |
 | `perfmon --doctor` | Check dependencies (btop, fzf, herdr, python3). |
 | `perfmon --cheats` | Print the command cheat sheet. |
 
 `fkill` never offers itself, your current shell and its ancestors, or the herdr
-server as targets.
+server as targets. Exit codes: 0 = killed and verified dead, 1 = nothing
+matched/refused/aborted, 2 = a kill failed or the process survived the wait
+window.
 
 ## The PERF MONITORING workspace
 
