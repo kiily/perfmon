@@ -13,9 +13,13 @@ PERFMON_DIR="${${(%):-%N}:A:h}"
 
 export PATH="$PERFMON_DIR/bin:$PATH"
 
-# Auto-launch on herdr attach. Backgrounded + silenced so shell startup stays
-# instant; perfmon --ensure is lock-guarded so concurrent pane shells are safe.
-# Set PERFMON_NO_AUTO=1 to disable.
-if [[ "${HERDR_ENV:-}" == "1" && -z "${PERFMON_NO_AUTO:-}" && -x "$PERFMON_DIR/bin/perfmon" ]]; then
+# Auto-launch ONLY inside the dedicated "perf" herdr session, so monitoring
+# lives in one place instead of every session. The session is identified by its
+# socket path: named sessions live at .../herdr/sessions/<name>/herdr.sock.
+# Backgrounded + silenced (instant startup); --ensure is lock-guarded so
+# concurrent pane shells are safe. Set PERFMON_NO_AUTO=1 to disable.
+if [[ "${HERDR_ENV:-}" == "1" && -z "${PERFMON_NO_AUTO:-}" \
+      && "${HERDR_SOCKET_PATH:-}" == */sessions/perf/* \
+      && -x "$PERFMON_DIR/bin/perfmon" ]]; then
   ( "$PERFMON_DIR/bin/perfmon" --ensure >/dev/null 2>&1 & ) 2>/dev/null
 fi

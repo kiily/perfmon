@@ -13,6 +13,16 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 BIN_DIR="$(dirname "$SELF")"
 MODE="focus"
 
+# ANSI palette → B/D/C/Y/R. Colors on a tty or when PERFMON_COLOR=1 (fzf
+# previews aren't ttys, so the guide forces it); plain when piped.
+_colors() {
+  if [ -t 1 ] || [ "${PERFMON_COLOR:-}" = 1 ]; then
+    B=$'\e[1m'; D=$'\e[2m'; C=$'\e[36m'; Y=$'\e[33m'; R=$'\e[0m'
+  else
+    B=""; D=""; C=""; Y=""; R=""
+  fi
+}
+
 case "${1:-}" in
   --ensure) MODE="ensure" ;;
   --doctor)
@@ -28,35 +38,40 @@ case "${1:-}" in
     [ "$ok" = 1 ] && echo "doctor: all good" || exit 1
     exit 0 ;;
   --cheats)
-    cat <<'EOF'
+    _colors
+    # %-18s aligns every description to the same column stop
+    # (widest command, "fkill --port 3000", is 17 chars → needs 18 for a gap).
+    row() { printf "    ${C}%-18s${R}%s\n" "$1" "$2"; }
+    cat <<EOF
 
-  PERF MONITORING — commands (available in any shell)
+  ${B}PERF MONITORING${R} ${D}· commands, in any shell${R}
+  ${D}────────────────────────────────────────${R}
 
-    memtop            what's eating memory, grouped by app
-    memtop --raw      ungrouped, per-process with PIDs
-    memtop --watch    live-refreshing view
-    fkill             fuzzy-pick process(es) to kill  [tab = multi-select]
-    fkill -9 vite     …with SIGKILL, pre-filtered to "vite"
-    fkill --match RE  non-interactive kill by command regex
-    fkill --port 3000 kill whatever holds a TCP port
-    fkill --app NAME  kill a whole app (root first, confirms)
-    fkill --list …    preview any selector without killing
-    perfmon           rebuild/focus this workspace
-    perfmon --doctor  dependency health check
-    perfmon --guide   situation guide (browsable overlay)
+ ${Y}see what's eating RAM${R}
+EOF
+    row "memtop"          "biggest consumers, grouped by app"
+    row "memtop --raw"    "ungrouped, per-process with PIDs"
+    row "memtop --watch"  "live-refreshing view"
+    printf "\n ${Y}kill something${R}\n"
+    row "fkill"           "fuzzy-pick · tab = multi-select"
+    row "fkill -9 vite"   "SIGKILL, pre-filtered to \"vite\""
+    row "fkill --match RE" "non-interactive kill by regex"
+    row "fkill --port 3000" "kill whatever holds a TCP port"
+    row "fkill --app NAME" "kill a whole app (root first)"
+    row "fkill --list …"  "preview any selector, no kill"
+    printf "\n ${Y}this workspace${R}\n"
+    row "perfmon"         "rebuild / focus it"
+    row "perfmon --doctor" "dependency health check"
+    row "perfmon --guide" "situation guide (overlay)"
+    cat <<EOF
 
-  btop (left): click a process → t/k to terminate/kill, m sorts by memory
-
+  ${D}btop (left): click a proc → ${R}${C}t${R}${D}/${R}${C}k${R}${D} kill · ${R}${C}←/→${R}${D} sort column${R}
 EOF
     exit 0 ;;
   --guide-section)
     # internal: one compact guide card (the --guide overlay's preview page).
     # Colors only when asked for (fzf preview is not a tty but renders ANSI).
-    if [ "${PERFMON_COLOR:-}" = 1 ]; then
-      B=$'\e[1m'; D=$'\e[2m'; C=$'\e[36m'; Y=$'\e[33m'; R=$'\e[0m'
-    else
-      B=""; D=""; C=""; Y=""; R=""
-    fi
+    _colors
     case "${2:-}" in
       1*) cat <<EOF
 
@@ -225,7 +240,10 @@ fi
 
 WS_ID=$(find_workspace) || WS_ID=""
 if [ -n "$WS_ID" ]; then
-  [ "$MODE" = "ensure" ] || herdr workspace focus "$WS_ID" >/dev/null
+  if [ "$MODE" != "ensure" ]; then
+    herdr workspace focus "$WS_ID" >/dev/null
+    echo "perfmon: focused '$LABEL' ($WS_ID)"
+  fi
   exit 0
 fi
 

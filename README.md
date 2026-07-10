@@ -41,6 +41,28 @@ Auto-launches whenever you attach to herdr (via the zshrc hook). Two tabs:
 - **Memory** — `memtop --watch` on top; `vm_stat 10` and a memory-pressure/swap
   watch below.
 
+## Monitoring across every herdr space
+
+There is **one** `PERF MONITORING` workspace, not one per space. Jump to it with
+`perfmon` (which now prints `focused …` so you know it worked — it switches you
+to a separate workspace rather than adding anything to your current one).
+
+**Don't clone the full workspace into every space.** The heavy pane is `btop`:
+it re-samples all ~1200 processes every 2s, continuously. One is cheap; five —
+one per space — is five full-machine samplers running at once, which is
+redundant and mildly self-defeating for a performance tool.
+
+For an at-a-glance readout in each space (quorum, flown, default, …), use the
+cheap gauge instead of the cockpit: add a tab running
+
+```sh
+memtop --watch 10
+```
+
+That's a `ps` every 10s (effectively free) showing free RAM %, swap, and the
+top apps. Keep `btop` in the one dedicated workspace; put `memtop --watch` where
+you want the glance.
+
 ## Install
 
 ```sh
