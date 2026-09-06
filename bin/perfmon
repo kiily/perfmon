@@ -1,9 +1,12 @@
 #!/bin/bash
-# perfmon — create or focus the "PERF MONITORING" herdr workspace.
-# Usage: perfmon                   create the workspace or focus it if it exists
+# perfmon — build the "PERF MONITORING" layout in the current herdr tab, or focus it.
+# Usage: perfmon                   build the layout here, or focus it if it exists
 #        perfmon --ensure          idempotent + never steals focus (used by auto-launch)
+#        perfmon --hog             worst cpu/mem process, one key to kill it
+#        perfmon --why             one-shot slowness diagnosis (works anywhere)
 #        perfmon --doctor          check dependencies
 #        perfmon --cheats          print the command cheat sheet
+#        perfmon --servers [SECS]  localhost servers that are listening
 #        perfmon --guide           browsable situation guide (overlay; plain when piped)
 #        perfmon --pressure-watch  memory-pressure loop (internal; loops forever)
 set -eu
@@ -25,6 +28,106 @@ _colors() {
 
 case "${1:-}" in
   --ensure) MODE="ensure" ;;
+  --why)
+    _colors
+    printf "\n ${B}why is it slow?${R}  ${D}sampling cpu for 2s…${R}\n"
+    # top -l 2: first sample is since-boot noise, second is a real 2s window
+    SAMPLE=$(top -l 2 -s 2 -stats pid,cpu,command -o cpu -n 7 2>/dev/null \
+      | awk '/^PID/{n++; next} n==2 && NF')
+    KPCT=$(echo "$SAMPLE" | awk '$3=="kernel_task"{print int($2)}')
+    WPCT=$(echo "$SAMPLE" | awk '$3=="WindowServer"{print int($2)}')
+    printf "\n ${Y}top cpu${R}\n"
+    echo "$SAMPLE" | awk '{printf "    %5.1f%%  %s (pid %s)\n", $2, substr($0, index($0,$3)), $1}'
+
+    printf "\n ${Y}memory${R}\n"
+    FREE=$(memory_pressure -Q 2>/dev/null | awk -F': ' '/percentage/{print $2}')
+    read -r STOT SUSED SPCT < <(sysctl -n vm.swapusage | awk '{
+      t=$3+0; u=$6+0; printf "%.1f %.1f %d\n", t/1024, u/1024, (t>0 ? u*100/t : 0)}')
+    COMPGB=$(vm_stat | awk -v p="$(sysctl -n hw.pagesize)" \
+      '/occupied by compressor/{printf "%.1f", $NF*p/1073741824}')
+    printf "    free %s · swap %sG of %sG used (%s%%) · compressor %sG\n" \
+      "${FREE:-?}" "$SUSED" "$STOT" "$SPCT" "${COMPGB:-?}"
+
+    printf "\n ${Y}browser renderers${R}  ${D}· each holds ~100–600MB${R}\n"
+    PS=$(ps ax)
+    for app in "Google Chrome" "Brave Browser" "Safari"; do
+      case "$app" in
+        Safari) pat="com.apple.WebKit.WebContent" ;;
+        *)      pat="$app Helper (Renderer)" ;;
+      esac
+      n=$(printf '%s\n' "$PS" | grep -Fc "$pat" || true)
+      [ "$n" -gt 0 ] && printf "    %-14s %s tabs/renderers\n" "$app" "$n"
+    done
+
+    printf "\n ${Y}reading it${R}\n"
+    HINTS=0
+    # free % (not swap %) decides starvation: macOS shrinks swap files lazily,
+    # so swap looks "full" for a while after pressure is already gone
+    FREEN=${FREE%\%}
+    if [ "${KPCT:-0}" -ge 70 ] && [ "${FREEN:-100}" -lt 40 ]; then
+      echo "    kernel_task busy + only ${FREE} free → RAM starvation: run memtop, kill the top hog"; HINTS=1
+    elif [ "${KPCT:-0}" -ge 70 ]; then
+      echo "    kernel_task busy but swap ok → heavy I/O, a device, or thermal: check 'pmset -g therm'"; HINTS=1
+    fi
+    if [ "${WPCT:-0}" -ge 30 ]; then
+      echo "    WindowServer high → something redraws constantly: video call, animated tab, screen share"; HINTS=1
+    fi
+    [ "$HINTS" = 0 ] && echo "    nothing screams — if it still feels slow, try memtop and 'perfmon --guide'"
+    echo ""
+    exit 0 ;;
+  --hog)
+    _colors
+    # the two victims that matter: worst cpu (real 2s window, not ps's
+    # since-launch average) and worst rss. Per-process, because that is what
+    # you actually kill — `fkill --app NAME` is the whole-bundle route.
+    CPU_ROW=$(top -l 2 -s 2 -stats pid,cpu,command -o cpu -n 1 2>/dev/null \
+      | awk '/^PID/{n++; next} n==2 && NF')
+    CPU_PID=$(echo "$CPU_ROW" | awk '{print $1}')
+    CPU_PCT=$(echo "$CPU_ROW" | awk '{print $2}')
+    # name from ps, not top: top truncates its COMMAND column ("Brave Browser He").
+    # ps knows nothing about pid 0 (kernel_task), so fall back to top's own text.
+    CPU_CMD=$(ps -p "${CPU_PID:-0}" -o comm= 2>/dev/null | sed 's|.*/||')
+    [ -n "$CPU_CMD" ] || CPU_CMD=$(echo "$CPU_ROW" | awk '{print substr($0, index($0,$3))}' | sed 's/ *$//')
+    MEM_ROW=$(ps -axo pid=,rss=,comm= | sort -k2 -rn | head -1)
+    MEM_PID=$(echo "$MEM_ROW" | awk '{print $1}')
+    MEM_GB=$(echo "$MEM_ROW" | awk '{printf "%.1f", $2/1048576}')
+    MEM_CMD=$(echo "$MEM_ROW" | awk '{print substr($0, index($0,$3))}' | sed 's|.*/||;s/ *$//')
+
+    printf "\n ${B}top hog${R}\n"
+    printf "  ${Y}cpu${R}  %6s%%  %s\n" "${CPU_PCT:-?}" "${CPU_CMD:-?}"
+    if [ "${CPU_PID:-0}" -le 1 ]; then
+      printf "       ${D}not killable — see 'perfmon --why' for what drives it${R}\n"
+    else
+      printf "       ${D}copy:${R} ${C}kill -9 %s${R}\n" "$CPU_PID"
+    fi
+    printf "  ${Y}mem${R}  %6s G  %s\n" "${MEM_GB:-?}" "${MEM_CMD:-?}"
+    printf "       ${D}copy:${R} ${C}kill -9 %s${R}\n\n" "${MEM_PID:-?}"
+
+    # piped/non-tty: the printout + copy lines are the whole feature
+    [ -t 0 ] && [ -t 1 ] || exit 0
+
+    printf " kill now? ${C}c${R}=cpu ${C}m${R}=mem ${C}b${R}=both ${D}enter=nothing${R} "
+    read -r PICK
+    VICTIMS=""
+    case "${PICK:-}" in
+      c|C) [ "${CPU_PID:-0}" -gt 1 ] && VICTIMS="$CPU_PID" || { echo " cpu hog is not killable"; exit 0; } ;;
+      m|M) VICTIMS="$MEM_PID" ;;
+      b|B) VICTIMS="$MEM_PID"; [ "${CPU_PID:-0}" -gt 1 ] && VICTIMS="$CPU_PID $MEM_PID" ;;
+      *) echo " nothing killed"; exit 0 ;;
+    esac
+    for pid in $VICTIMS; do
+      [ -n "$pid" ] || continue
+      NAME=$(ps -p "$pid" -o comm= 2>/dev/null) || NAME=""
+      [ -n "$NAME" ] || { echo " $pid already gone"; continue; }
+      kill "$pid" 2>/dev/null || { echo " could not signal $pid ($NAME)"; continue; }
+      sleep 1
+      if ps -p "$pid" >/dev/null 2>&1; then
+        printf " %s still alive — ${C}kill -9 %s${R}\n" "$NAME" "$pid"
+      else
+        echo " killed $pid  $NAME"
+      fi
+    done
+    exit 0 ;;
   --doctor)
     ok=1
     for dep in btop fzf herdr python3; do
@@ -34,7 +137,7 @@ case "${1:-}" in
         echo "MISSING $dep — install with: brew install $dep"; ok=0
       fi
     done
-    [ "${HERDR_ENV:-}" = "1" ] && echo "ok      running inside herdr" || echo "note    not inside herdr (workspace features unavailable)"
+    [ "${HERDR_ENV:-}" = "1" ] && echo "ok      running inside herdr" || echo "note    not inside herdr (tab layout unavailable)"
     [ "$ok" = 1 ] && echo "doctor: all good" || exit 1
     exit 0 ;;
   --cheats)
@@ -49,9 +152,13 @@ case "${1:-}" in
 
  ${Y}see what's eating RAM${R}
 EOF
+    row "perfweb"         "localhost dashboard, click to kill"
+    row "perfmon --hog"   "worst cpu/mem process + kill it"
+    row "perfmon --why"   "one-shot slowness diagnosis"
     row "memtop"          "biggest consumers, grouped by app"
     row "memtop --raw"    "ungrouped, per-process with PIDs"
     row "memtop --watch"  "live-refreshing view"
+    row "perfmon --servers" "localhost servers still listening"
     printf "\n ${Y}kill something${R}\n"
     row "fkill"           "fuzzy-pick · tab = multi-select"
     row "fkill -9 vite"   "SIGKILL, pre-filtered to \"vite\""
@@ -65,7 +172,7 @@ EOF
     row "perfmon --guide" "situation guide (overlay)"
     cat <<EOF
 
-  ${D}btop (left): click a proc → ${R}${C}t${R}${D}/${R}${C}k${R}${D} kill · ${R}${C}←/→${R}${D} sort column${R}
+  ${D}btop: click a proc → ${R}${C}t${R}${D}/${R}${C}k${R}${D} kill · ${R}${C}←/→${R}${D} sort column${R}
 EOF
     exit 0 ;;
   --guide-section)
@@ -77,6 +184,8 @@ EOF
 
  ${B}Mac feels slow · fans spinning${R}
  ${D}──────────────────────────────${R}
+  ${C}perfmon --why${R}   full diagnosis: cpu,
+                  swap, browsers, hints
   ${C}memtop${R}          who eats RAM, by app
   ${C}memtop --raw${R}    per-process, PIDs
   ${C}memtop --watch${R}  live view · ^C stops
@@ -178,6 +287,31 @@ EOF
       echo "$TOPICS" | while read -r t; do "$SELF" --guide-section "$t"; done
     fi
     exit 0 ;;
+  --servers)
+    # Which of my dev servers is still up, and from which repo? A "*:" bind is
+    # reachable on localhost too, so it counts. cwd comes from one extra lsof.
+    _colors
+    while :; do
+      SRV=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $(NF-1) ~ /^(127\.0\.0\.1|\[::1\]|localhost|\*):/ {
+        n=$(NF-1); sub(/.*:/, "", n); print n, $2, $1 }' | sort -u -k1,1n -k2,2n)
+      PIDS=$(printf '%s' "$SRV" | awk 'NF{print $2}' | sort -un | paste -sd, -)
+      CWDS=""
+      [ -n "$PIDS" ] && CWDS=$(lsof -a -d cwd -p "$PIDS" -Fn 2>/dev/null || true)
+      [ -n "${2:-}" ] && clear
+      printf "\n ${B}localhost servers${R}  ${D}%s${R}\n" "$(date '+%H:%M:%S')"
+      if [ -z "$SRV" ]; then
+        printf "\n  ${D}nothing listening${R}\n"
+      else
+        printf " ${D}%-7s %-8s %-16s %s${R}\n" PORT PID PROCESS DIR
+        awk -v home="$HOME" -v c="$C" -v d="$D" -v r="$R" '
+          NR==FNR { if (/^p/) pid=substr($0,2); else if (/^n/) cwd[pid]=substr($0,2); next }
+          { dir=cwd[$2]; sub("^" home, "~", dir)
+            printf " %s%-7s%s %-8s %-16s %s%s%s\n", c, $1, r, $2, $3, d, dir, r }
+        ' <(printf '%s\n' "$CWDS") <(printf '%s\n' "$SRV")
+      fi
+      [ -n "${2:-}" ] || exit 0
+      sleep "$2"
+    done ;;
   --pressure-watch)
     while :; do
       clear
@@ -189,24 +323,26 @@ EOF
       memory_pressure 2>/dev/null | grep -E "^(Swapins|Swapouts|Faults|Pageins):" | head -4
       sleep 10
     done ;;
-  -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
   "") ;;
   *) echo "perfmon: unknown option $1" >&2; exit 1 ;;
 esac
 
 if [ "${HERDR_ENV:-}" != "1" ]; then
-  echo "perfmon: not inside herdr (HERDR_ENV != 1); nothing to do" >&2
-  exit 1
+  [ "$MODE" = "ensure" ] && exit 0
+  # no herdr tab to build out here — the diagnosis is the useful thing
+  echo "perfmon: not inside herdr — running the slowness diagnosis instead" >&2
+  exec "$SELF" --why
 fi
 
 json() { python3 -c "import sys,json,os;$1"; }
 
-find_workspace() {
+find_tab() {
   # empty-on-error is intentional here: callers treat "" as not-found
-  herdr workspace list 2>/dev/null | LABEL="$LABEL" json "
-ws=json.load(sys.stdin)['result']['workspaces']
-m=[w for w in ws if w.get('label')==os.environ['LABEL']]
-print(m[0]['workspace_id'] if m else '')" 2>/dev/null
+  herdr tab list 2>/dev/null | LABEL="$LABEL" json "
+ts=json.load(sys.stdin)['result']['tabs']
+m=[t for t in ts if t.get('label')==os.environ['LABEL']]
+print(m[0]['tab_id'] if m else '')" 2>/dev/null
 }
 
 # ── race-safe check-and-create (multiple pane shells start at attach) ──────
@@ -231,23 +367,26 @@ if ! acquire_lock; then
   [ "$MODE" = "ensure" ] && exit 0
   # focus mode: wait briefly for the builder, then just try to focus
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    WS_ID=$(find_workspace) || WS_ID=""
-    [ -n "$WS_ID" ] && { herdr workspace focus "$WS_ID" >/dev/null; exit 0; }
+    TAB_ID=$(find_tab) || TAB_ID=""
+    [ -n "$TAB_ID" ] && { herdr tab focus "$TAB_ID" >/dev/null; exit 0; }
     sleep 1
   done
   exit 0
 fi
 
-WS_ID=$(find_workspace) || WS_ID=""
-if [ -n "$WS_ID" ]; then
+TAB_ID=$(find_tab) || TAB_ID=""
+if [ -n "$TAB_ID" ]; then
   if [ "$MODE" != "ensure" ]; then
-    herdr workspace focus "$WS_ID" >/dev/null
-    echo "perfmon: focused '$LABEL' ($WS_ID)"
+    herdr tab focus "$TAB_ID" >/dev/null
+    echo "perfmon: focused '$LABEL' ($TAB_ID)"
   fi
   exit 0
 fi
 
-# ── build ───────────────────────────────────────────────────────────────────
+# ── build (in the invoking tab — no new workspace) ─────────────────────────
+CUR_PANE="${HERDR_PANE_ID:-}"; CUR_TAB="${HERDR_TAB_ID:-}"
+[ -n "$CUR_PANE" ] && [ -n "$CUR_TAB" ] || { echo "perfmon: HERDR_PANE_ID/HERDR_TAB_ID not set" >&2; exit 1; }
+
 # btop: default to memory sorting if the user has no config yet
 BTOP_CONF="$HOME/.config/btop/btop.conf"
 if [ ! -f "$BTOP_CONF" ]; then
@@ -255,17 +394,9 @@ if [ ! -f "$BTOP_CONF" ]; then
   printf 'proc_sorting = "memory"\nupdate_ms = 2000\n' > "$BTOP_CONF"
 fi
 
-FOCUS_FLAG=""
-[ "$MODE" = "ensure" ] && FOCUS_FLAG="--no-focus"
-
-CREATE=$(herdr workspace create --cwd "$HOME" --label "$LABEL" $FOCUS_FLAG)
-{ read -r WS_ID; read -r TAB1; read -r PANE1; } < <(printf '%s' "$CREATE" | python3 -c '
-import sys, json
-r = json.load(sys.stdin)["result"]
-i = lambda v, k: v[k] if isinstance(v, dict) else v
-print(i(r["workspace"], "workspace_id")); print(i(r["tab"], "tab_id")); print(i(r["root_pane"], "pane_id"))
-')
-[ -n "$WS_ID" ] && [ -n "$PANE1" ] || { echo "perfmon: unexpected create response: $CREATE" >&2; exit 1; }
+# rename first: the label is the dedup key, so concurrent --ensure runs from
+# the panes created below see it and exit early
+herdr tab rename "$CUR_TAB" "$LABEL" >/dev/null
 
 # quote paths as data for the pane command strings (survives quotes/spaces)
 printf -v SELF_Q '%q' "$SELF"
@@ -273,19 +404,17 @@ printf -v MEMTOP_Q '%q' "$BIN_DIR/memtop"
 
 new_pane_id() { json "print(json.load(sys.stdin)['result']['pane']['pane_id'])"; }
 
-# Tab 1: Overview — btop (left ~70%) + command shell with cheat sheet (right)
-herdr tab rename "$TAB1" "Overview" >/dev/null 2>&1 || true
-CHEAT_PANE=$(herdr pane split "$PANE1" --direction right --ratio 0.7 --no-focus | new_pane_id)
-herdr pane run "$PANE1" "btop"
-herdr pane run "$CHEAT_PANE" "clear; $SELF_Q --cheats"
-
-# Tab 2: Memory — memtop watch (top) + vm_stat / pressure+swap (bottom)
-TAB2_JSON=$(herdr tab create --workspace "$WS_ID" --label "Memory" --no-focus)
-PANE2=$(echo "$TAB2_JSON" | json "r=json.load(sys.stdin)['result'];p=r['root_pane'];print(p['pane_id'] if isinstance(p,dict) else p)")
-VMSTAT_PANE=$(herdr pane split "$PANE2" --direction down --ratio 0.55 --no-focus | new_pane_id)
+# One tab: btop (left ~55%) · right column = cheats / memtop watch / vm_stat+pressure
+CHEAT_PANE=$(herdr pane split "$CUR_PANE" --direction right --ratio 0.55 --no-focus | new_pane_id)
+MEM_PANE=$(herdr pane split "$CHEAT_PANE" --direction down --ratio 0.35 --no-focus | new_pane_id)
+VMSTAT_PANE=$(herdr pane split "$MEM_PANE" --direction down --ratio 0.55 --no-focus | new_pane_id)
 PRESSURE_PANE=$(herdr pane split "$VMSTAT_PANE" --direction right --ratio 0.5 --no-focus | new_pane_id)
-herdr pane run "$PANE2" "$MEMTOP_Q --watch 5"
+herdr pane run "$CHEAT_PANE" "clear; $SELF_Q --cheats"
+herdr pane run "$MEM_PANE" "$MEMTOP_Q --watch 5"
 herdr pane run "$VMSTAT_PANE" "vm_stat 10"
 herdr pane run "$PRESSURE_PANE" "$SELF_Q --pressure-watch"
+# btop last: typed into the invoking pane's shell, runs when it reaches a prompt
+# (in focus mode that's right after this script exits)
+herdr pane run "$CUR_PANE" "btop"
 
-echo "perfmon: workspace '$LABEL' created ($WS_ID)"
+echo "perfmon: built '$LABEL' in this tab ($CUR_TAB)"

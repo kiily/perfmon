@@ -41,17 +41,17 @@ snapshot() {
   echo "RAM: $((TOTAL_BYTES / 1073741824)) GB total   free: ${free_pct:-n/a}   swap:${swap}"
   echo ""
   if [ "$RAW" = 1 ]; then
-    printf "%8s %7s  %-6s %s\n" "MEM(GB)" "%RAM" "PID" "COMMAND"
-    ps -axo rss=,pid=,comm= | sort -rn | head -n "$LIMIT" | \
+    printf "%8s %7s %7s  %-6s %s\n" "MEM(GB)" "%RAM" "%CPU" "PID" "COMMAND"
+    ps -axo rss=,%cpu=,pid=,comm= | sort -rn | head -n "$LIMIT" | \
       awk -v total="$TOTAL_BYTES" '{
-        rss=$1; pid=$2; $1=""; $2=""; cmd=substr($0,3);
-        printf "%8.2f %6.1f%%  %-6s %s\n", rss/1048576, (rss*1024/total)*100, pid, cmd
+        rss=$1; cpu=$2; pid=$3; $1=""; $2=""; $3=""; cmd=substr($0,4);
+        printf "%8.2f %6.1f%% %6.1f%%  %-6s %s\n", rss/1048576, (rss*1024/total)*100, cpu, pid, cmd
       }'
   else
-    printf "%8s %7s %6s  %s\n" "MEM(GB)" "%RAM" "PROCS" "APP"
-    ps -axo rss=,comm= | awk -v total="$TOTAL_BYTES" '
+    printf "%8s %7s %7s %6s  %s\n" "MEM(GB)" "%RAM" "%CPU" "PROCS" "APP"
+    ps -axo rss=,%cpu=,comm= | awk -v total="$TOTAL_BYTES" '
       {
-        rss=$1; $1=""; cmd=substr($0,2);
+        rss=$1; c=$2; $1=""; $2=""; cmd=substr($0,3);
         key=""
         # Group by the first .app bundle in the path (Chrome Helper → Google Chrome)
         n=split(cmd, parts, "/")
@@ -61,13 +61,13 @@ snapshot() {
           sub(/ Helper.*$/, "", key)
           sub(/\.helper.*$/, "", key)
         }
-        mem[key]+=rss; count[key]++
+        mem[key]+=rss; cpu[key]+=c; count[key]++
       }
       END {
-        for (k in mem) printf "%.6f\t%d\t%s\n", mem[k]/1048576, count[k], k
+        for (k in mem) printf "%.6f\t%.1f\t%d\t%s\n", mem[k]/1048576, cpu[k], count[k], k
       }' | sort -rn | head -n "$LIMIT" | \
       awk -F'\t' -v total="$TOTAL_BYTES" '{
-        printf "%8.2f %6.1f%% %6d  %s\n", $1, ($1*1073741824/total)*100, $2, $3
+        printf "%8.2f %6.1f%% %6.1f%% %6d  %s\n", $1, ($1*1073741824/total)*100, $2, $3, $4
       }'
   fi
 }

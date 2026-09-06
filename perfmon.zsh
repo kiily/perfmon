@@ -1,6 +1,6 @@
 # perfmon shell integration — sourced from ~/.zshrc
-# Adds memtop/fkill/perfmon to PATH and auto-launches the PERF MONITORING
-# herdr workspace when a shell starts inside herdr.
+# Adds memtop/fkill/perfmon to PATH and auto-builds the PERF MONITORING
+# herdr tab when a shell starts inside the perf herdr session.
 
 # Derive the install dir from this file's location so the repo is relocatable.
 # ${(%):-%N} is the currently-sourced file (robust under source, unlike $0,
@@ -23,3 +23,12 @@ if [[ "${HERDR_ENV:-}" == "1" && -z "${PERFMON_NO_AUTO:-}" \
       && -x "$PERFMON_DIR/bin/perfmon" ]]; then
   ( "$PERFMON_DIR/bin/perfmon" --ensure >/dev/null 2>&1 & ) 2>/dev/null
 fi
+
+# One keystroke, any prompt: ^G = the dashboard, ^O = the top hog + kill it.
+# Widgets (not aliases) so they fire on an empty or half-typed line.
+_perfmon_widget() { BUFFER="perfmon"; zle accept-line }
+_perfmon_hog_widget() { BUFFER="perfmon --hog"; zle accept-line }
+zle -N _perfmon_widget
+zle -N _perfmon_hog_widget
+bindkey '^G' _perfmon_widget
+bindkey '^O' _perfmon_hog_widget

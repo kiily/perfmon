@@ -28,5 +28,5 @@ Guidance for AI coding agents working in this repo. Based on Andrej Karpathy's
 - Scripts live in `bin/` and must stay runnable standalone from any shell.
 - Non-trivial logic gets a check in `test/smoke.sh`. Run `bash test/smoke.sh`
   before you call a change done.
-- `perfmon` re-finds its herdr workspace by **label**, never by cached id
+- `perfmon` re-finds its herdr tab by **label**, never by cached id
   (ids are session-scoped). Don't reintroduce id caching.

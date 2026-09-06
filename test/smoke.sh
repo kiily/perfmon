@@ -18,10 +18,11 @@ poll()  { # poll <cmd...> — retry up to ~3s (0.1s steps) until cmd succeeds
 OUT=$(memtop -n 5)
 check "memtop runs"            test -n "$OUT"
 check "memtop header"          grep -q "MEM(GB)" <<<"$OUT"
+check "memtop cpu column"      grep -q "%CPU" <<<"$OUT"
 check "memtop swap line"       grep -q "swap:" <<<"$OUT"
 check "memtop has rows"        test "$(grep -cE '^\s+[0-9]+\.[0-9]+' <<<"$OUT")" -ge 3
 OUT_RAW=$(memtop --raw -n 5)
-check "memtop --raw has PIDs"  grep -qE '^\s+[0-9.]+\s+[0-9.]+%\s+[0-9]+' <<<"$OUT_RAW"
+check "memtop --raw has PIDs"  grep -qE '^\s+[0-9.]+\s+[0-9.]+%\s+[0-9.]+%\s+[0-9]+' <<<"$OUT_RAW"
 check "memtop --watch 0 rejected"    fails memtop --watch 0
 check "memtop -n missing value"      fails memtop -n
 
@@ -125,17 +126,63 @@ check "fkill --app helper dead"       poll bash -c "! kill -0 $BHELP 2>/dev/null
 check "fkill --app unknown exits 1"   fails fkill --app "no-such-app-$$" --force
 cleanup_b
 
+# --- perfweb --------------------------------------------------------------
+# Real server on an ephemeral-ish port: token guard, stats shape, and a kill
+# that has to actually land.
+WPORT=$((30000 + $$ % 20000))
+WLOG="${TMPDIR:-/tmp}/perfweb-smoke-$$.log"
+perfweb --port "$WPORT" --no-open >"$WLOG" 2>&1 &
+WPID=$!
+cleanup_w() { { kill "$WPID"; wait "$WPID"; } 2>/dev/null; rm -f "$WLOG"; return 0; }
+web_up() { grep -q "perfweb: http" "$WLOG"; }
+if poll web_up; then
+  WTOK=$(awk '/perfweb: http/{print $2}' "$WLOG"); WTOK=${WTOK##*t=}
+  API="http://127.0.0.1:$WPORT"
+  check "perfweb serves page"      bash -c "curl -sf '$API/?t=$WTOK' | grep -q 'perfmon'"
+  check "perfweb stats json"       bash -c "curl -sf '$API/api/stats?t=$WTOK' | grep -q '\"procs\"'"
+  check "perfweb rejects no token" bash -c "! curl -sf '$API/api/stats'"
+  check "perfweb rejects bad host" bash -c "! curl -sf -H 'Host: evil.com' '$API/api/stats?t=$WTOK'"
+  check "perfweb kill needs header" bash -c "! curl -sf -X POST -d '{\"pid\":1}' '$API/api/kill?t=$WTOK'"
+  # stdout=DEVNULL is load-bearing: a child holding the command-substitution
+  # pipe open hangs $( ) forever, even after python exits.
+  WDUM=$(python3 -c "import subprocess as s; print(s.Popen(['sleep','900$$'], start_new_session=True, stdout=s.DEVNULL, stderr=s.DEVNULL).pid)")
+  check "perfweb kills a process"  bash -c "curl -sf -m 10 -X POST -H 'X-Perfweb: 1' -d '{\"pid\":$WDUM}' '$API/api/kill?t=$WTOK' | grep -q '\"ok\": true'"
+  check "perfweb target dead"      poll bash -c "! kill -0 $WDUM 2>/dev/null"
+  check "perfweb refuses own pid"  bash -c "curl -sf -X POST -H 'X-Perfweb: 1' -d '{\"pid\":$WPID}' '$API/api/kill?t=$WTOK' | grep -q 'refused'"
+else
+  echo "FAIL perfweb did not start"; FAIL=1
+fi
+cleanup_w
+
 # --- perfmon --------------------------------------------------------------
 check "perfmon --doctor"       perfmon --doctor
 check "perfmon --guide"        bash -c "perfmon --guide | grep -q 'already in use'"
 check "perfmon --cheats"       bash -c "perfmon --cheats | grep -q 'fkill --port'"
-if [ "${HERDR_ENV:-}" = "1" ]; then
+check "perfmon --hog"          bash -c "perfmon --hog | grep -q 'kill -9'"
+check "perfmon --hog never prompts piped" bash -c "! perfmon --hog </dev/null | grep -q 'kill now'"
+check "perfmon --servers"     bash -c "perfmon --servers | grep -q 'localhost servers'"
+check "perfmon --why"          bash -c "perfmon --why | grep -q 'top cpu'"
+check "perfmon outside herdr"  bash -c "HERDR_ENV= perfmon 2>/dev/null | grep -q 'top cpu'"
+# perfmon now builds in the invoking tab, so only test idempotency when the
+# PERF MONITORING tab already exists — a fresh build would take over this tab.
+count_perf_tabs() { herdr tab list | python3 -c 'import sys,json; ts=json.load(sys.stdin)["result"]["tabs"]; print(sum(1 for t in ts if t.get("label")=="PERF MONITORING"))' 2>/dev/null || echo "?"; }
+if [ "${HERDR_ENV:-}" = "1" ] && [ "$(count_perf_tabs)" = "1" ]; then
   perfmon --ensure >/dev/null 2>&1
   perfmon --ensure >/dev/null 2>&1
-  N=$(herdr workspace list | python3 -c 'import sys,json; ws=json.load(sys.stdin)["result"]["workspaces"]; print(sum(1 for w in ws if w.get("label")=="PERF MONITORING"))' 2>/dev/null || echo "?")
-  if [ "$N" = "1" ]; then echo "ok   perfmon idempotent (1 workspace)"; else echo "FAIL perfmon idempotent (count=$N)"; FAIL=1; fi
+  N=$(count_perf_tabs)
+  if [ "$N" = "1" ]; then echo "ok   perfmon idempotent (1 tab)"; else echo "FAIL perfmon idempotent (count=$N)"; FAIL=1; fi
 else
-  echo "skip perfmon workspace checks (not inside herdr)"
+  echo "skip perfmon tab checks (needs herdr + an existing PERF MONITORING tab)"
+fi
+
+# --- perfsession (only if the perf session server is already running) ------
+count_perf_ws() { herdr --session perf workspace list 2>/dev/null | python3 -c 'import sys,json; ws=json.load(sys.stdin)["result"]["workspaces"]; print(sum(1 for w in ws if any(n in (w.get("label") or "") for n in ("COMMANDS","VISUALS","SERVERS"))))' 2>/dev/null || echo "?"; }
+if [ "$(count_perf_ws)" = "3" ]; then
+  HERDR_ENV=1 perfsession >/dev/null 2>&1
+  N=$(count_perf_ws)
+  if [ "$N" = "3" ]; then echo "ok   perfsession idempotent (3 spaces)"; else echo "FAIL perfsession idempotent (count=$N)"; FAIL=1; fi
+else
+  echo "skip perfsession checks (needs a built perf session)"
 fi
 
 echo ""

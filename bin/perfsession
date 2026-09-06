@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# perfsession — build (or attach to) the dedicated "perf" herdr session.
+#   COMMANDS · two working shells, cheat sheet printed in the left one
+#   VISUALS  · btop + memtop watch + vm_stat + memory pressure
+#   SERVERS  · every localhost listener, refreshed, with its project dir
+# Idempotent: if the spaces already exist it just attaches.
+set -euo pipefail
+
+SESSION=perf
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+H() { herdr --session "$SESSION" "$@"; }
+json() { python3 -c "import sys,json;$1"; }
+pane_id() { json "print(json.load(sys.stdin)['result']['root_pane']['pane_id'])"; }
+split_id() { json "print(json.load(sys.stdin)['result']['pane']['pane_id'])"; }
+
+printf -v PERFMON_Q '%q' "$BIN_DIR/perfmon"
+printf -v MEMTOP_Q  '%q' "$BIN_DIR/memtop"
+
+# start the session's server headless if it isn't up yet, then wait for it
+if ! H workspace list >/dev/null 2>&1 || H workspace list 2>/dev/null | grep -q server_not_running; then
+  ( herdr --session "$SESSION" server >/dev/null 2>&1 & )
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    H workspace list 2>/dev/null | grep -q '"workspaces"' && break
+    sleep 1
+  done
+fi
+
+have_ws() { H workspace list 2>/dev/null | LABEL="$1" json "
+import os
+ws=json.load(sys.stdin)['result']['workspaces']
+sys.exit(0 if any(os.environ['LABEL'] in (w.get('label') or '') for w in ws) else 1)"; }
+
+# PERFMON_NO_AUTO: this script owns the layout, so the zsh auto-launch hook
+# must not also build the one-tab dashboard in these spaces.
+new_ws() { H workspace create --label "$1" --cwd "$HOME" --env PERFMON_NO_AUTO=1 "$2"; }
+
+if ! have_ws VISUALS; then
+  BTOP=$(new_ws "📊 VISUALS" --no-focus | pane_id)
+  MEM=$(H pane split "$BTOP" --direction right --ratio 0.55 --no-focus | split_id)
+  VMS=$(H pane split "$MEM" --direction down --ratio 0.45 --no-focus | split_id)
+  PRESSURE=$(H pane split "$VMS" --direction right --ratio 0.5 --no-focus | split_id)
+  H tab rename "${BTOP%%:p*}:t1" "PERF MONITORING" >/dev/null
+  H pane run "$MEM" "$MEMTOP_Q --watch 5"
+  H pane run "$VMS" "vm_stat 10"
+  H pane run "$PRESSURE" "$PERFMON_Q --pressure-watch"
+  H pane run "$BTOP" "btop"
+fi
+
+if ! have_ws COMMANDS; then
+  LEFT=$(new_ws "⚡ COMMANDS" --focus | pane_id)
+  RIGHT=$(H pane split "$LEFT" --direction right --ratio 0.5 --no-focus | split_id)
+  H tab rename "${LEFT%%:p*}:t1" "PERF COMMANDS" >/dev/null
+  H pane run "$RIGHT" "$MEMTOP_Q"
+  H pane run "$LEFT" "clear; $PERFMON_Q --cheats"
+fi
+
+if ! have_ws SERVERS; then
+  SRV=$(new_ws "🌐 SERVERS" --no-focus | pane_id)
+  H tab rename "${SRV%%:p*}:t1" "LOCALHOST SERVERS" >/dev/null
+  H pane run "$SRV" "$PERFMON_Q --servers 10"
+fi
+
+if [ "${HERDR_ENV:-}" = "1" ]; then
+  echo "perfsession: '$SESSION' ready — attach from a plain terminal: herdr session attach $SESSION"
+  exit 0
+fi
+exec herdr session attach "$SESSION"
