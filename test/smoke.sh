@@ -161,6 +161,26 @@ check "perfmon --cheats"       bash -c "perfmon --cheats | grep -q 'fkill --port
 check "perfmon --hog"          bash -c "perfmon --hog | grep -q 'kill -9'"
 check "perfmon --hog never prompts piped" bash -c "! perfmon --hog </dev/null | grep -q 'kill now'"
 check "perfmon --servers"     bash -c "perfmon --servers | grep -q 'localhost servers'"
+# --- perfmon --reap -------------------------------------------------------
+# An orphan (ppid 1) holding a port, dev-looking name, no herdr pane above it:
+# exactly what --reap targets. Piped, it must list and kill nothing.
+REAP_JS="${TMPDIR:-/tmp}/perfmon-smoke-vite-dev.js"
+cat > "$REAP_JS" <<'JS'
+require('http').createServer((q, s) => s.end('ok')).listen(39251, '127.0.0.1');
+JS
+nohup bash -c "node '$REAP_JS' >/dev/null 2>&1 &" >/dev/null 2>&1
+if poll bash -c "lsof -nP -iTCP:39251 -sTCP:LISTEN >/dev/null 2>&1"; then
+  ORPHAN=$(lsof -nP -iTCP:39251 -sTCP:LISTEN -t | head -1)
+  OUT=$(perfmon --reap 0)
+  check "perfmon --reap spots the orphan" grep -q 39251 <<<"$OUT"
+  check "perfmon --reap piped kills nothing" ps -p "$ORPHAN"
+  check "perfmon --reap respects age"    bash -c "perfmon --reap 999 | grep -q 'nothing to reap'"
+  kill "$ORPHAN" 2>/dev/null
+else
+  echo "skip perfmon --reap checks (could not start the orphan)"
+fi
+rm -f "$REAP_JS"
+
 check "perfmon --why"          bash -c "perfmon --why | grep -q 'top cpu'"
 check "perfmon outside herdr"  bash -c "HERDR_ENV= perfmon 2>/dev/null | grep -q 'top cpu'"
 # perfmon now builds in the invoking tab, so only test idempotency when the

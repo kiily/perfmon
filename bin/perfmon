@@ -7,6 +7,7 @@
 #        perfmon --doctor          check dependencies
 #        perfmon --cheats          print the command cheat sheet
 #        perfmon --servers [SECS]  localhost servers that are listening
+#        perfmon --reap [MINS]     kill abandoned dev servers (default 30m)
 #        perfmon --guide           browsable situation guide (overlay; plain when piped)
 #        perfmon --pressure-watch  memory-pressure loop (internal; loops forever)
 set -eu
@@ -159,6 +160,7 @@ EOF
     row "memtop --raw"    "ungrouped, per-process with PIDs"
     row "memtop --watch"  "live-refreshing view"
     row "perfmon --servers" "localhost servers still listening"
+    row "perfmon --reap"   "kill abandoned dev servers"
     printf "\n ${Y}kill something${R}\n"
     row "fkill"           "fuzzy-pick · tab = multi-select"
     row "fkill -9 vite"   "SIGKILL, pre-filtered to \"vite\""
@@ -312,6 +314,87 @@ EOF
       [ -n "${2:-}" ] || exit 0
       sleep "$2"
     done ;;
+  --reap)
+    # Abandoned dev servers: nothing in their ancestry is a herdr pane any more
+    # (the agent that started them is gone), they hold a localhost port, and
+    # they've outlived MINS. A server a pane still owns is never a candidate —
+    # an agent may be mid-run on it.
+    _colors
+    MINS="${2:-30}"
+    VICTIMS=$(python3 - "$MINS" <<'PY'
+import re, subprocess, sys, collections
+MINS = float(sys.argv[1])
+def sh(*a): return subprocess.run(a, capture_output=True, text=True).stdout
+def secs(e):
+    d, _, t = e.rpartition("-") if "-" in e else ("0", "", e)
+    p = [float(x) for x in t.split(":")]
+    while len(p) < 3: p.insert(0, 0)
+    return float(d or 0)*86400 + p[0]*3600 + p[1]*60 + p[2]
+ppid, age, cmd, kids = {}, {}, {}, collections.defaultdict(list)
+for l in sh("ps", "-Ao", "pid=,ppid=,etime=,command=").splitlines():
+    f = l.split(None, 3)
+    if len(f) < 4: continue
+    p = int(f[0]); ppid[p] = int(f[1]); age[p] = secs(f[2]); cmd[p] = f[3]
+    kids[int(f[1])].append(p)
+ports = collections.defaultdict(set)
+for l in sh("lsof", "-nP", "-iTCP", "-sTCP:LISTEN").splitlines()[1:]:
+    f = l.split()
+    if len(f) < 2 or not re.match(r"^(127\.0\.0\.1|\[::1\]|localhost|\*):", f[-2]): continue
+    ports[int(f[1])].add(f[-2].rsplit(":", 1)[1])
+# only things that look like a dev server an agent spawned — never a daemon
+DEV = re.compile(r"shell-snapshots|next(-server| dev| start)|vite|webpack|nodemon|npm run (dev|start)")
+roots = set()
+for pid in ports:
+    chain, q = [], pid
+    while q > 1 and len(chain) < 40:
+        chain.append(q); q = ppid.get(q, 1)
+    if any("herdr" in cmd.get(c, "") for c in chain): continue
+    root = chain[-1]
+    if age.get(root, 0) < MINS*60: continue
+    if any(DEV.search(cmd.get(c, "")) for c in chain): roots.add(root)
+def tree(p, out):
+    out.add(p)
+    for k in kids[p]: tree(k, out)
+    return out
+for root in sorted(roots):
+    pids = tree(root, set())
+    ps_ = sorted({x for q in pids for x in ports.get(q, ())}, key=int)
+    label = next((cmd[q] for q in sorted(pids) if "next" in cmd.get(q, "") or "node" in cmd.get(q, "")), cmd[root])
+    print("%s|%s|%d|%s" % (",".join(map(str, sorted(pids))), ",".join(ps_), age[root]//60, label[:64]))
+PY
+)
+    printf "\n ${B}abandoned dev servers${R}  ${D}older than %s min, no herdr pane left${R}\n" "$MINS"
+    if [ -z "$VICTIMS" ]; then
+      printf "\n  ${D}nothing to reap${R}\n\n"; exit 0
+    fi
+    printf "\n ${D}%-9s %-8s %s${R}\n" PORTS AGE PROCESS
+    echo "$VICTIMS" | while IFS='|' read -r pids ps_ mins label; do
+      printf " ${C}%-9s${R} %-8s %s\n" "$ps_" "${mins}m" "$label"
+      printf "   ${D}pids: %s${R}\n" "$pids"
+    done
+    ALL=$(echo "$VICTIMS" | cut -d'|' -f1 | tr ',' '\n' | sort -un | tr '\n' ' ')
+    echo ""
+    # piped/non-tty: the list is the whole feature, same rule as --hog
+    [ -t 0 ] && [ -t 1 ] || exit 0
+    printf " reap them? ${C}y${R} ${D}enter=nothing${R} "
+    read -r PICK || PICK=""
+    case "${PICK:-}" in
+      y|Y) ;;
+      *) echo " nothing killed"; exit 0 ;;
+    esac
+    # children first, so a supervisor can't respawn one on its way out
+    for pid in $(echo "$ALL" | tr ' ' '\n' | sort -rn); do
+      kill "$pid" 2>/dev/null || true
+    done
+    sleep 2
+    LEFT=""
+    for pid in $ALL; do ps -p "$pid" >/dev/null 2>&1 && LEFT="$LEFT $pid"; done
+    if [ -n "$LEFT" ]; then
+      printf " still alive —${C}kill -9%s${R}\n" "$LEFT"
+    else
+      printf " ${D}reaped %s${R}\n" "$(echo $ALL | tr ' ' ',')"
+    fi
+    exit 0 ;;
   --pressure-watch)
     while :; do
       clear
@@ -323,7 +406,7 @@ EOF
       memory_pressure 2>/dev/null | grep -E "^(Swapins|Swapouts|Faults|Pageins):" | head -4
       sleep 10
     done ;;
-  -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
   "") ;;
   *) echo "perfmon: unknown option $1" >&2; exit 1 ;;
 esac

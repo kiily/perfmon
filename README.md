@@ -29,6 +29,7 @@ All available in every shell once installed:
 | `perfmon --doctor` | Check dependencies (btop, fzf, herdr, python3). |
 | `perfmon --cheats` | Print the command cheat sheet. |
 | `perfmon --servers [secs]` | Every localhost TCP listener with its PID and working directory — which dev server is still up, and from which repo. With `secs`, refreshes in place. |
+| `perfmon --reap [mins]` | Kill abandoned dev servers: holding a port, older than `mins` (default 30), and with no herdr pane left in their ancestry. Lists them and asks once; piped, it only lists. A server a pane still owns is never a candidate. |
 | `perfmon --guide` | Practical how-to guide organized by situation ("port busy", "app gone feral", "it won't die"). |
 
 `fkill` never offers itself, your current shell and its ancestors, or the herdr
