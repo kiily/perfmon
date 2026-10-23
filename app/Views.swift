@@ -547,7 +547,7 @@ struct ServerRow: View {
             Button("Copy URL") { copy(url.absoluteString) }
             Divider()
             if !listener.dir.isEmpty {
-                Button("Show Folder in Finder") { NSWorkspace.shared.open(URL(fileURLWithPath: listener.dir)) }
+                Button("Show Folder in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: listener.dir)]) }
             }
             if let id = listener.container {
                 Button("Copy Container ID") { copy(String(id.prefix(12))) }
@@ -598,7 +598,7 @@ struct PortRow: View {
         .contextMenu {
             Button("Copy Port") { copy(String(use.port)) }
             if !use.dir.isEmpty {
-                Button("Show Folder in Finder") { NSWorkspace.shared.open(URL(fileURLWithPath: use.dir)) }
+                Button("Show Folder in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: use.dir)]) }
             }
             Divider()
             Button("Forget") { monitor.forget(use) }
