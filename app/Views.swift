@@ -12,6 +12,8 @@ struct Panel: View {
     @AppStorage("sort") private var sort = SortKey.memory
     @AppStorage("tab") private var tab = Tab.apps
     @State private var chart: Metric?
+    @AppStorage("menuBattery") private var menuBattery = false
+    @AppStorage("alerts") private var alerts = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -25,9 +27,11 @@ struct Panel: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
             }
             listHeader
-            switch tab {
-            case .apps: AppList(monitor: monitor, sort: sort)
-            case .servers: ServerList(monitor: monitor)
+            CappedScroll(maxHeight: listMaxHeight) {
+                switch tab {
+                case .apps: AppList(monitor: monitor, sort: sort)
+                case .servers: ServerList(monitor: monitor)
+                }
             }
             Divider()
             footer
@@ -58,6 +62,12 @@ struct Panel: View {
                 .foregroundStyle(monitor.status.tint)
                 .contentTransition(.symbolEffect(.replace))
         }
+    }
+
+    /// Whatever the screen has left once the header, tiles and an open chart are drawn.
+    private var listMaxHeight: CGFloat {
+        let screen = NSScreen.main?.visibleFrame.height ?? 800
+        return max(160, screen - (chart == nil ? 330 : 440))
     }
 
     // MARK: Tiles — each one opens its 24 h history
@@ -96,18 +106,20 @@ struct Panel: View {
         return Tile(title: "Thermal", symbol: "thermometer.medium", value: label, tint: tint,
                     selected: chart == .thermal) { toggle(.thermal) } detail: {
             if let w = monitor.battery?.watts { Text("Drawing \(w, format: .number.precision(.fractionLength(1))) W") }
-            if monitor.thermal != .nominal { Text("Sort apps by CPU for the cause") }
         }
     }
 
     @ViewBuilder private var batteryTile: some View {
         if let b = monitor.battery {
-            Tile(title: "Battery", symbol: b.charging ? "battery.100percent.bolt" : "battery.75percent",
+            Tile(title: "Battery", symbol: batterySymbol(b),
                  value: "\(b.percent)%", tint: !b.pluggedIn && b.percent <= 15 ? .orange : .primary,
                  selected: chart == .battery) { toggle(.battery) } detail: {
-                if let m = b.minutesLeft { Text("\(m / 60)h \(m % 60)m to \(b.charging ? "full" : "empty")") }
-                else if b.pluggedIn { Text(b.charging ? "Charging" : "Plugged in") }
-                Text("\(b.health.map { "\($0)% health · " } ?? "")\(b.cycles) cycles")
+                Group {
+                    if let m = b.minutesLeft { Text("\(m / 60)h \(m % 60)m to \(b.charging ? "full" : "empty")") }
+                    else if b.pluggedIn { Text(b.charging ? "Charging" : "Plugged in") }
+                    else { Text("On battery") }
+                }
+                .help("\(b.health.map { "\($0)% health · " } ?? "")\(b.cycles) cycles")
             }
         } else {
             Tile(title: "Power", symbol: "powerplug", value: "AC", tint: .primary, selected: false) {} detail: {
@@ -148,7 +160,14 @@ struct Panel: View {
                 NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"))
             }
             Spacer()
+            if monitor.battery != nil {
+                Toggle("Low Power", isOn: Binding(get: { monitor.lowPower }, set: { monitor.setLowPower($0) }))
+                    .toggleStyle(.switch).controlSize(.mini)
+                    .help("Low Power Mode — macOS asks for your password to change it")
+            }
             Menu {
+                Toggle("Show Battery in Menu Bar", isOn: $menuBattery)
+                Toggle("Alerts for Memory and Heat", isOn: $alerts)
                 Toggle("Open at Login", isOn: Binding(
                     get: { SMAppService.mainApp.status == .enabled },
                     set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }))
@@ -183,14 +202,15 @@ struct Tile<Detail: View>: View {
                 Label(title, systemImage: symbol)
                     .font(.caption.weight(.medium)).foregroundStyle(.secondary)
                 Text(value)
-                    .font(.title3.weight(.semibold)).monospacedDigit()
+                    .font(.headline).monospacedDigit()
                     .contentTransition(.numericText())
                     .foregroundStyle(tint)
                     .lineLimit(1).minimumScaleFactor(0.7)
+                    .fixedSize(horizontal: false, vertical: true)   // shrink only for width, never height
                 Group { detail }.font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
-            .frame(maxWidth: .infinity, minHeight: 78, alignment: .topLeading)
-            .padding(10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(.horizontal, 10).padding(.vertical, 8)
             .background(.quaternary.opacity(hovering || selected ? 0.9 : 0.5), in: .rect(cornerRadius: 10))
             .overlay {
                 RoundedRectangle(cornerRadius: 10).strokeBorder(selected ? Color.accentColor : .clear, lineWidth: 1.5)
@@ -330,7 +350,7 @@ struct HistoryChart: View {
         }
         .chartYAxis { AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) }
         .chartXSelection(value: $hover)
-        .frame(height: 110)
+        .frame(height: 64)
     }
 
     /// "15:02 · 82% · Brave 28 GB" — the value and who caused it.
@@ -443,8 +463,8 @@ struct ServerList: View {
     var body: some View {
         let dev = monitor.listeners.filter(\.isDev).sorted { $0.ports[0] < $1.ports[0] }
         let other = monitor.listeners.filter { !$0.isDev }.sorted { $0.name < $1.name }
-        let live = Set(dev.flatMap { l in l.ports.map { "\($0)|\(l.project ?? l.name)" } })
-        let past = monitor.ports.filter { !live.contains($0.id) }.sorted { $0.lastSeen > $1.lastSeen }.prefix(6)
+        let live = Set(dev.flatMap(\.ports))
+        let past = monitor.ports.filter { !live.contains($0.port) }.sorted { $0.lastSeen > $1.lastSeen }.prefix(6)
 
         VStack(alignment: .leading, spacing: 2) {
             if dev.isEmpty {
@@ -487,7 +507,14 @@ struct ServerRow: View {
             }
             .frame(width: 62, alignment: .leading)
             VStack(alignment: .leading, spacing: 1) {
-                Text(listener.project ?? listener.name).lineLimit(1)
+                HStack(spacing: 4) {
+                    if listener.container != nil {
+                        Image(systemName: "shippingbox").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text(listener.container != nil && listener.project != listener.name
+                         ? "\(listener.project ?? "") · \(listener.name)" : listener.project ?? listener.name)
+                        .lineLimit(1).truncationMode(.middle)
+                }
                 Text(listener.command).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
             }
             Spacer(minLength: 4)
@@ -499,7 +526,9 @@ struct ServerRow: View {
                 }
                 .help("Stop (⌥-click to force)")
             } else {
-                Text(age(since: listener.started)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                // Docker's "Up 7 days (healthy)" → "7 days"
+                Text(listener.status.map { String($0.replacingOccurrences(of: "Up ", with: "").prefix { $0 != "(" }) } ?? age(since: listener.started))
+                    .font(.caption).monospacedDigit().foregroundStyle(.secondary).lineLimit(1)
             }
         }
         .buttonStyle(.plain).foregroundStyle(.secondary)
@@ -508,7 +537,9 @@ struct ServerRow: View {
         .background(.quaternary.opacity(hovering ? 0.6 : 0), in: .rect(cornerRadius: 6))
         .contentShape(.rect)
         .onHover { hovering = $0 }
-        .help("\(listener.dir)\nPID \(listener.pid) · \(bytes(listener.memory)) · ports \(listener.ports.map(String.init).joined(separator: ", "))")
+        .help(listener.container != nil
+              ? "Docker container · \(listener.command)\nports \(listener.ports.map(String.init).joined(separator: ", "))"
+              : "\(listener.dir)\nPID \(listener.pid) · \(bytes(listener.memory)) · ports \(listener.ports.map(String.init).joined(separator: ", "))")
         .contextMenu {
             ForEach(listener.ports, id: \.self) { p in
                 Button("Open localhost:\(String(p))") { NSWorkspace.shared.open(URL(string: "http://localhost:\(p)")!) }
@@ -518,7 +549,11 @@ struct ServerRow: View {
             if !listener.dir.isEmpty {
                 Button("Show Folder in Finder") { NSWorkspace.shared.open(URL(fileURLWithPath: listener.dir)) }
             }
-            Button("Copy PID") { copy(String(listener.pid)) }
+            if let id = listener.container {
+                Button("Copy Container ID") { copy(String(id.prefix(12))) }
+            } else {
+                Button("Copy PID") { copy(String(listener.pid)) }
+            }
             Divider()
             Button("Stop") { stop(force: false) }
             Button("Force Stop") { stop(force: true) }
@@ -526,6 +561,14 @@ struct ServerRow: View {
     }
 
     private func stop(force: Bool) {
+        if let id = listener.container {
+            Task {
+                let stopped = await Task.detached { dockerAPI("POST", "/containers/\(id)/\(force ? "kill" : "stop")", timeout: 15) != nil }.value
+                if !stopped { NSSound.beep() }
+                monitor.refreshSoon()
+            }
+            return
+        }
         if kill(listener.pid, force ? SIGKILL : SIGTERM) != 0 { NSSound.beep() }
         monitor.refreshSoon()
     }
@@ -563,7 +606,28 @@ struct PortRow: View {
     }
 }
 
+/// Lays content out at its natural height, scrolling only past `maxHeight`.
+struct CappedScroll<Content: View>: View {
+    let maxHeight: CGFloat
+    @ViewBuilder let content: Content
+    @State private var height: CGFloat = 0
+
+    var body: some View {
+        ScrollView {
+            content.onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
+        }
+        .frame(height: min(max(height, 1), maxHeight))
+        .scrollBounceBehavior(.basedOnSize)
+    }
+}
+
 // MARK: - Formatting
+
+func batterySymbol(_ b: Battery) -> String {
+    if b.charging { return "battery.100percent.bolt" }
+    let level = [100, 75, 50, 25, 0].first { b.percent >= $0 - 12 } ?? 0
+    return "battery.\(level)percent"
+}
 
 func bytes(_ n: UInt64) -> String { Int64(n).formatted(.byteCount(style: .memory)) }
 func gb(_ n: UInt64) -> String { "\((Double(n) / 1_073_741_824).formatted(.number.precision(.fractionLength(0...1)))) GB" }

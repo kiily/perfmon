@@ -1,9 +1,11 @@
 // PerfmonApp.swift — the menu bar extra and the model behind it.
 import SwiftUI
+import UserNotifications
 
 @main
 struct PerfmonApp: App {
     @State private var monitor = Monitor()
+    @AppStorage("menuBattery") private var menuBattery = false
 
     init() {
         if CommandLine.arguments.contains("--selftest") { exit(selfTest()) }
@@ -14,11 +16,30 @@ struct PerfmonApp: App {
             Panel(monitor: monitor)
         } label: {
             // Template image + number, like the system's own status items.
-            Image(systemName: monitor.status.symbol)
-            Text("\(Int(monitor.cpu.rounded()))%")
+            if menuBattery, let b = monitor.battery {
+                // A status item shows one image + one text; draw the pair of readouts as a single template image.
+                Image(nsImage: templateImage(HStack(spacing: 4) {
+                    Image(systemName: monitor.status.symbol)
+                    Text("\(Int(monitor.cpu.rounded()))%")
+                    Image(systemName: batterySymbol(b)).padding(.leading, 4)
+                    Text("\(b.percent)%")
+                }))
+            } else {
+                Image(systemName: monitor.status.symbol)
+                Text("\(Int(monitor.cpu.rounded()))%")
+            }
         }
         .menuBarExtraStyle(.window)
     }
+}
+
+@MainActor
+func templateImage(_ view: some View) -> NSImage {
+    let renderer = ImageRenderer(content: view.font(.system(size: 13)).monospacedDigit())
+    renderer.scale = NSScreen.main?.backingScaleFactor ?? 2
+    let image = renderer.nsImage ?? NSImage()
+    image.isTemplate = true   // the menu bar tints it for light/dark and highlight
+    return image
 }
 
 // MARK: - Persistence types
@@ -67,6 +88,7 @@ final class Monitor {
     var swap: UInt64 = 0
     var thermal = ProcessInfo.ThermalState.nominal
     var battery: Battery?
+    var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
     var apps: [AppUsage] = []
     var listeners: [Listener] = []
     var history: [Minute] = []
@@ -88,6 +110,8 @@ final class Monitor {
     private var lastScanNs: UInt64 = 0
     private var pending: (cpu: [Double], watts: [Double], minute: Minute)?
     private var lastSave = Date.now
+    private var alerting: Set<String> = []
+    private var lastAlert: [String: Date] = [:]
 
     private static let stateURL = URL.applicationSupportDirectory.appending(path: "Perfmon/state.json")
 
@@ -100,6 +124,7 @@ final class Monitor {
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { self.save() }
         }
+        _ = Alerts.shared
         restart()
     }
 
@@ -136,6 +161,7 @@ final class Monitor {
             swap = swapUsed()
             thermal = ProcessInfo.processInfo.thermalState
             battery = readBattery()
+            lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
             apps = snap.apps
             listeners = snap.listeners
         }
@@ -144,6 +170,7 @@ final class Monitor {
         nextSample = .now.addingTimeInterval(interval)
         record()
         recordPorts()
+        checkAlerts()
         if lastSave.timeIntervalSinceNow < -600 { save() }
     }
 
@@ -204,6 +231,35 @@ final class Monitor {
         if ports.count > 300 { ports = Array(ports.sorted { $0.lastSeen > $1.lastSeen }.prefix(300)) }
     }
 
+    // MARK: Alerts
+
+    /// One notification per episode (condition turns on), at most every 15 min per kind,
+    /// naming the app to blame with a Quit button.
+    private func checkAlerts() {
+        guard UserDefaults.standard.object(forKey: "alerts") as? Bool ?? true else { return }
+        let hog = apps.max { $0.memory < $1.memory }
+        let busy = apps.max { $0.cpu < $1.cpu }
+        alert("memory", when: pressure == .critical, title: "Memory is critically low",
+              body: hog.map { "\($0.name) is using \(bytes($0.memory)). Quitting it frees the most." } ?? "", app: hog)
+        alert("thermal", when: thermal.rawValue >= ProcessInfo.ThermalState.serious.rawValue, title: "Your Mac is running hot",
+              body: busy.map { "\($0.name) is using \(Int($0.cpu))% CPU." } ?? "", app: busy)
+    }
+
+    private func alert(_ kind: String, when on: Bool, title: String, body: String, app: AppUsage?) {
+        defer { if on { alerting.insert(kind) } else { alerting.remove(kind) } }
+        guard on, !alerting.contains(kind), (lastAlert[kind] ?? .distantPast).timeIntervalSinceNow < -900 else { return }
+        lastAlert[kind] = .now
+        Alerts.shared.post(id: kind, title: title, body: body, app: app)
+    }
+
+    /// pmset needs root; AppleScript's admin prompt is the sanctioned way to ask for it.
+    func setLowPower(_ on: Bool) {
+        var error: NSDictionary?
+        NSAppleScript(source: "do shell script \"/usr/bin/pmset -a lowpowermode \(on ? 1 : 0)\" with administrator privileges")?
+            .executeAndReturnError(&error)
+        lowPower = error == nil ? on : ProcessInfo.processInfo.isLowPowerModeEnabled
+    }
+
     func forget(_ use: PortUse) { ports.removeAll { $0.id == use.id } }
 
     func save() {
@@ -229,5 +285,52 @@ final class Monitor {
         if cpu > 85 { return ("CPU busy", "cpu", .orange) }
         if let b = battery, !b.pluggedIn, b.percent <= 15 { return ("Battery low", "battery.25percent", .orange) }
         return ("Healthy", "gauge.with.dots.needle.33percent", .green)
+    }
+}
+
+// MARK: - Notifications
+
+/// Posts the alerts; the Quit action quits the named app from the banner.
+@MainActor
+final class Alerts: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = Alerts()
+    private let center = UNUserNotificationCenter.current()
+
+    override init() {
+        super.init()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    func post(id: String, title: String, body: String, app: AppUsage?) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        if let app {
+            // ponytail: one category, retitled per post; an older banner's button shows the newest app name.
+            center.setNotificationCategories([UNNotificationCategory(
+                identifier: "hog", actions: [UNNotificationAction(identifier: "quit", title: "Quit \(app.name)")],
+                intentIdentifiers: [])])
+            content.categoryIdentifier = "hog"
+            content.userInfo = ["pids": app.pids.map(Int.init), "bundle": app.bundlePath ?? "", "name": app.name]
+        }
+        center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        guard response.actionIdentifier == "quit" else { return }
+        let info = response.notification.request.content.userInfo
+        let pids = (info["pids"] as? [Int] ?? []).map { pid_t($0) }
+        let bundle = (info["bundle"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let name = info["name"] as? String ?? ""
+        await MainActor.run {
+            _ = quit(AppUsage(name: name, bundlePath: bundle, pids: pids, memory: 0, cpu: 0), force: false)
+        }
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
     }
 }

@@ -15,8 +15,16 @@ A native menu bar app: CPU % in the menu bar; click it for the panel.
 - **Apps**: top 8 by memory or CPU, helpers grouped like `memtop`. Hover → ✕ quits
   (⌥-click force quits); right-click for Force Quit, Show in Finder, Copy PIDs.
 - **Servers**: every dev server you run — port, project (git repo it started in), command,
-  uptime. Hover to open it in the browser or stop it. **Recently used** remembers which project
+  uptime. Docker containers get their own rows (compose project · name, image, "Up 3 days"),
+  read from the Docker Engine socket; stopping one runs `docker stop`. Hover to open it in the
+  browser or stop it. **Recently used** remembers which project
   had which port, so "what was on 3000?" has an answer.
+- **Alerts**: a notification when memory pressure turns critical or the Mac runs hot, naming
+  the app to blame with a **Quit** button. Once per episode, at most every 15 min.
+- **Battery**: gear menu → *Show Battery in Menu Bar* puts the battery % next to the CPU %, so the
+  system Battery item can go. The footer's **Low Power** switch flips Low Power Mode (macOS asks
+  for your admin password).
+- Long lists scroll inside the panel instead of running off the screen.
 - The ring next to the list fills until the next refresh: every 2 s with the panel open,
   every 10 s in the background (~1% of one core, 18 MB).
 

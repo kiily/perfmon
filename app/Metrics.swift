@@ -16,7 +16,7 @@ struct Battery {
 
 /// A process holding a listening TCP socket.
 struct Listener: Identifiable {
-    var id: pid_t { pid }
+    var id: String { container ?? String(pid) }
     var pid: pid_t
     var ports: [UInt16]
     var name: String
@@ -27,9 +27,12 @@ struct Listener: Identifiable {
     var command: String     // argv with paths shortened: "node next dev"
     var started: Date
     var memory: UInt64
-    // ponytail: "dev" = a bare binary that isn't macOS's own, plus container runtimes whose ports are your containers.
+    var container: String? = nil   // Docker container id; pid is then the runtime's
+    var status: String? = nil      // Docker's "Up 3 days"
+    // ponytail: "dev" = started from a project folder, or a bare binary that isn't macOS's own,
+    // plus containers. Python.app/Node in a bundle still count via their project folder.
     var isDev: Bool {
-        if ["Docker", "OrbStack", "Rancher Desktop"].contains(name) { return true }
+        if project != nil || container != nil || containerRuntimes.contains(name) { return true }
         return bundlePath == nil && !["/System/", "/usr/libexec/", "/usr/sbin/", "/Library/Apple/"].contains { path.hasPrefix($0) }
     }
 }
@@ -200,7 +203,7 @@ func scanProcesses(prevCPU: [pid_t: UInt64], elapsedNs: UInt64) -> Snapshot {
                 started: startTime(pid), memory: ri.ri_phys_footprint))
         }
     }
-    return Snapshot(apps: Array(groups.values), listeners: listeners, cpu: cpuNow)
+    return Snapshot(apps: Array(groups.values), listeners: withContainers(listeners), cpu: cpuNow)
 }
 
 func listeningPorts(_ pid: pid_t) -> [UInt16] {
@@ -262,6 +265,86 @@ func projectName(_ dir: String) -> String? {
     return URL(fileURLWithPath: dir).lastPathComponent
 }
 
+// MARK: - Docker
+
+let containerRuntimes: Set<String> = ["Docker", "OrbStack", "Rancher Desktop"]
+
+/// A row of `GET /containers/json` (field names are the Engine API's).
+struct Container: Decodable {
+    let Id: String
+    let Names: [String]
+    let Image: String
+    let Created: Double
+    let Status: String
+    let Labels: [String: String]?
+    let Ports: [Port]
+    struct Port: Decodable { let PublicPort: UInt16? }
+
+    /// Compose service ("db") when there is one, else the container name.
+    var name: String {
+        Labels?["com.docker.compose.service"] ?? Names.first.map { String($0.drop { $0 == "/" }) } ?? String(Id.prefix(12))
+    }
+    var publicPorts: [UInt16] { Set(Ports.compactMap(\.PublicPort)).sorted() }
+    var project: String? { Labels?["com.docker.compose.project"] }
+    var workingDir: String? { Labels?["com.docker.compose.project.working_dir"] }
+}
+
+/// The runtime's process listens for every published port; swap those ports
+/// for one row per container: name, compose project, image.
+func withContainers(_ listeners: [Listener]) -> [Listener] {
+    guard let runtime = listeners.first(where: { containerRuntimes.contains($0.name) }),
+          let data = dockerAPI("GET", "/containers/json"),
+          let containers = try? JSONDecoder().decode([Container].self, from: data) else { return listeners }
+    let published = Set(containers.flatMap(\.publicPorts))
+    var out = listeners.compactMap { l -> Listener? in
+        guard containerRuntimes.contains(l.name) else { return l }
+        var l = l
+        l.ports.removeAll(where: published.contains)
+        return l.ports.isEmpty ? nil : l
+    }
+    for c in containers where !c.publicPorts.isEmpty {
+        out.append(Listener(
+            pid: runtime.pid, ports: c.publicPorts, name: c.name, bundlePath: runtime.bundlePath, path: runtime.path,
+            dir: c.workingDir ?? "", project: c.project ?? c.name, command: c.Image,
+            started: Date(timeIntervalSince1970: c.Created), memory: 0, container: c.Id, status: c.Status))
+    }
+    return out
+}
+
+private let dockerSockets = ["/.docker/run/docker.sock", "/.orbstack/run/docker.sock"].map { NSHomeDirectory() + $0 }
+    + ["/var/run/docker.sock"]
+
+/// One HTTP/1.0 request to the Docker Engine socket; the body on 2xx, else nil.
+/// HTTP/1.0 means no chunked encoding: read to EOF and split off the headers.
+func dockerAPI(_ method: String, _ path: String, timeout: Int = 2) -> Data? {
+    for sock in dockerSockets where FileManager.default.fileExists(atPath: sock) {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
+        _ = withUnsafeMutablePointer(to: &addr.sun_path) {
+            $0.withMemoryRebound(to: CChar.self, capacity: capacity) { strlcpy($0, sock, capacity) }
+        }
+        var tv = timeval(tv_sec: timeout, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        guard connected == 0 else { continue }
+        let request = "\(method) \(path) HTTP/1.0\r\nHost: docker\r\nContent-Length: 0\r\n\r\n"
+        guard write(fd, request, request.utf8.count) == request.utf8.count else { continue }
+        var response = Data()
+        var buf = [UInt8](repeating: 0, count: 65_536)
+        while case let n = read(fd, &buf, buf.count), n > 0 { response.append(contentsOf: buf[..<n]) }
+        guard let split = response.range(of: Data("\r\n\r\n".utf8)) else { continue }
+        let status = String(decoding: response.prefix(12), as: UTF8.self)   // "HTTP/1.0 200"
+        return status.dropFirst(9).hasPrefix("2") ? Data(response[split.upperBound...]) : nil
+    }
+    return nil
+}
+
 /// Graceful first: a running app gets a normal Quit (it may ask to save).
 /// Returns false when nothing could be signalled (e.g. another user's process).
 @MainActor
@@ -310,6 +393,15 @@ func selfTest() -> Int32 {
         check("listener: is dev", found?.isDev == true)
         server.terminate()
     } else { check("listener: nc started", false) }
+
+    let fixture = #"[{"Id":"abc123def4567890","Names":["/supabase_db"],"Image":"postgres:15","Created":1700000000,"Status":"Up 3 days","Labels":{"com.docker.compose.project":"super-invoices"},"Ports":[{"PrivatePort":5432,"PublicPort":54322,"Type":"tcp"},{"PrivatePort":5432,"PublicPort":54322,"Type":"tcp"},{"PrivatePort":9000,"Type":"tcp"}]}]"#
+    let parsed = try? JSONDecoder().decode([Container].self, from: Data(fixture.utf8))
+    check("docker: container row parsed",
+          parsed?.first?.name == "supabase_db" && parsed?.first?.publicPorts == [54322] && parsed?.first?.project == "super-invoices")
+    if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.docker.docker").isEmpty {
+        let live = dockerAPI("GET", "/containers/json").flatMap { try? JSONDecoder().decode([Container].self, from: $0) }
+        check("docker: engine API answers", live != nil)
+    }
 
     if let b = readBattery() { check("battery percent", (0...100).contains(b.percent)) }
     return failed ? 1 : 0

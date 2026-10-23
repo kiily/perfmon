@@ -36,6 +36,7 @@ echo "built $APP ($(du -sh "$APP" | cut -f1), dmg $(du -h "$OUT/Perfmon.dmg" | c
 
 if [ "${1:-}" = "--install" ]; then
   pkill -x Perfmon 2>/dev/null || true
+  while pgrep -x Perfmon >/dev/null; do sleep 0.2; done   # open fails (-600) while the old one is still quitting
   rm -rf /Applications/Perfmon.app
   cp -R "$APP" /Applications/
   open /Applications/Perfmon.app
