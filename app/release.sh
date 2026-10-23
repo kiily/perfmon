@@ -20,13 +20,10 @@ git commit -qm "perfmon.app $V" -- "$DIR/Info.plist"
 git push -q
 gh release create "v$V" "$DIR/build/Perfmon.dmg" --title "Perfmon $V" --generate-notes
 
-# Private repo: brew downloads through the API by asset id, with your gh token.
-ASSET=$(gh api "repos/$REPO/releases/tags/v$V" -q '.assets[] | select(.name == "Perfmon.dmg") | .id')
 SHA=$(shasum -a 256 "$DIR/build/Perfmon.dmg" | cut -d' ' -f1)
 sed -i '' -E \
   -e "s/^  version \".*\"/  version \"$V\"/" \
   -e "s/^  sha256 \".*\"/  sha256 \"$SHA\"/" \
-  -e "s|releases/assets/[0-9]+|releases/assets/$ASSET|" \
   Casks/perfmon.rb
 git commit -qm "cask: perfmon $V" -- Casks/perfmon.rb
 git push -q
