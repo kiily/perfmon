@@ -2,7 +2,7 @@
 # Install: brew tap kiily/perfmon https://github.com/kiily/perfmon && brew install --cask perfmon
 cask "perfmon" do
   version "1.1.0"
-  sha256 "446576d2d474b8940e27f86d5a4cf70cb108a1a9a3fa0f06f7b835816b5a5500"
+  sha256 "795a330b3320e43e0b45002a4692e5e782fff72391d688dfdd7597e092eb4565"
 
   url "https://github.com/kiily/perfmon/releases/download/v#{version}/Perfmon.dmg"
   name "Perfmon"
