@@ -4,6 +4,35 @@ Machine performance monitoring for macOS + [herdr](https://herdr.dev). Answers
 "what is eating my memory?" and lets you kill the offender from the terminal in
 seconds.
 
+## Perfmon.app (menu bar)
+
+A native menu bar app: CPU % in the menu bar; click it for the panel.
+
+- **Clock + verdict**: Healthy / Memory pressure / Warm / Running hot / CPU busy / Battery low.
+- **Tiles**: CPU (live sparkline), memory (pressure gauge + swap), thermal state + system watts,
+  battery (time left, health, cycles). **Click a tile for its last 24 hours**; hover the chart to
+  see the value and which app was on top at that minute.
+- **Apps**: top 8 by memory or CPU, helpers grouped like `memtop`. Hover → ✕ quits
+  (⌥-click force quits); right-click for Force Quit, Show in Finder, Copy PIDs.
+- **Servers**: every dev server you run — port, project (git repo it started in), command,
+  uptime. Hover to open it in the browser or stop it. **Recently used** remembers which project
+  had which port, so "what was on 3000?" has an answer.
+- The ring next to the list fills until the next refresh: every 2 s with the panel open,
+  every 10 s in the background (~1% of one core, 18 MB).
+
+History and the port ledger live in `~/Library/Application Support/Perfmon/state.json`.
+Only processes you own are listed (root-owned ones like WindowServer can't be read or killed
+without admin rights).
+
+```bash
+app/build.sh --install     # ~0.5 MB app, ~250 KB DMG; installs to /Applications and launches
+app/release.sh 1.2.0       # bump, build, GitHub release, update the cask
+brew tap kiily/perfmon https://github.com/kiily/perfmon && brew install --cask perfmon   # any Mac
+```
+
+The app is ad-hoc signed (no paid Apple Developer ID). The cask clears the download
+quarantine; a DMG opened by hand needs right-click → Open the first time.
+
 ## Commands
 
 All available in every shell once installed:

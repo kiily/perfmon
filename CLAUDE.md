@@ -25,6 +25,10 @@ Guidance for AI coding agents working in this repo. Based on Andrej Karpathy's
 
 - Pure `bash` + macOS tools (`ps`, `vm_stat`, `memory_pressure`, `sysctl`) and
   the `herdr` CLI. No package manager, no build step. Keep it that way.
+- Exception: `app/` is the native menu bar app (SwiftUI + Charts, three Swift
+  files). Built by `app/build.sh` with plain `swiftc` + `actool` — no Xcode
+  project, no SwiftPM, no third-party packages. Releases: `app/release.sh`. Read metrics via Mach/sysctl/libproc/IOKit, never
+  by shelling out. `Perfmon --selftest` holds its checks.
 - Scripts live in `bin/` and must stay runnable standalone from any shell.
 - Non-trivial logic gets a check in `test/smoke.sh`. Run `bash test/smoke.sh`
   before you call a change done.

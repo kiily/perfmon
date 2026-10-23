@@ -26,6 +26,15 @@ check "memtop --raw has PIDs"  grep -qE '^\s+[0-9.]+\s+[0-9.]+%\s+[0-9.]+%\s+[0-
 check "memtop --watch 0 rejected"    fails memtop --watch 0
 check "memtop -n missing value"      fails memtop -n
 
+# --- Perfmon.app ----------------------------------------------------------
+if command -v swiftc >/dev/null; then
+  check "app builds"             bash "$DIR/app/build.sh"
+  check "app self-test"          "$DIR/app/build/Perfmon.app/Contents/MacOS/Perfmon" --selftest
+  check "app signature valid"    codesign --verify --strict "$DIR/app/build/Perfmon.app"
+else
+  echo "skip app checks (needs swiftc: xcode-select --install)"
+fi
+
 # --- fkill ----------------------------------------------------------------
 # Dummy target must live in its own process group (fkill rightly refuses to
 # target its own group, which a same-shell background job would share).
