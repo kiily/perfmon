@@ -26,7 +26,7 @@ A native menu bar app: CPU % in the menu bar; click it for the panel.
   for your admin password).
 - Long lists scroll inside the panel instead of running off the screen.
 - The ring next to the list fills until the next refresh: every 2 s with the panel open,
-  every 10 s in the background (~1% of one core, 18 MB).
+  every 10 s in the background (~0.3% of one core, 19 MB); the closed panel is never redrawn.
 
 History and the port ledger live in `~/Library/Application Support/Perfmon/state.json`.
 Only processes you own are listed (root-owned ones like WindowServer can't be read or killed

@@ -64,10 +64,10 @@ struct Panel: View {
         }
     }
 
-    /// Whatever the screen has left once the header, tiles and an open chart are drawn.
+    /// About ten rows, then scroll; shrinks on short screens so the panel never reaches the bottom.
     private var listMaxHeight: CGFloat {
         let screen = NSScreen.main?.visibleFrame.height ?? 800
-        return max(160, screen - (chart == nil ? 330 : 440))
+        return max(160, min(340, screen - (chart == nil ? 420 : 520)))
     }
 
     // MARK: Tiles — each one opens its 24 h history
@@ -146,11 +146,7 @@ struct Panel: View {
                 }
                 .pickerStyle(.menu).labelsHidden().fixedSize().controlSize(.small)
             }
-            if monitor.hasSampled {
-                RefreshRing(from: monitor.lastSample, to: monitor.nextSample).id(monitor.lastSample)
-            } else {
-                ProgressView().controlSize(.mini)
-            }
+            RefreshRing(from: monitor.lastSample, to: monitor.nextSample).id(monitor.lastSample)
         }
     }
 
@@ -374,18 +370,6 @@ struct AppList: View {
         let sorted = monitor.apps.sorted { sort == .memory ? $0.memory > $1.memory : $0.cpu > $1.cpu }.prefix(8)
         let top = sorted.first.map { sort == .memory ? Double($0.memory) : $0.cpu } ?? 1
         VStack(alignment: .leading, spacing: 2) {
-            if !monitor.hasSampled {
-                ForEach(0..<6, id: \.self) { _ in
-                    HStack(spacing: 8) {
-                        RoundedRectangle(cornerRadius: 4).frame(width: 18, height: 18)
-                        Text("Application name")
-                        Spacer()
-                        Text("0.0 GB")
-                    }
-                    .font(.callout).padding(.horizontal, 6).padding(.vertical, 4)
-                }
-                .redacted(reason: .placeholder)
-            }
             ForEach(sorted) { app in
                 AppRow(app: app, sort: sort, share: (sort == .memory ? Double(app.memory) : app.cpu) / max(top, 1)) { force in
                     if !quit(app, force: force) { NSSound.beep() }
@@ -468,7 +452,7 @@ struct ServerList: View {
 
         VStack(alignment: .leading, spacing: 2) {
             if dev.isEmpty {
-                Text(monitor.hasSampled ? "No dev servers running" : "Looking for servers…")
+                Text("No dev servers running")
                     .font(.callout).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 44)
             }

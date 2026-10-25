@@ -29,18 +29,27 @@ struct Listener: Identifiable {
     var memory: UInt64
     var container: String? = nil   // Docker container id; pid is then the runtime's
     var status: String? = nil      // Docker's "Up 3 days"
-    // ponytail: "dev" = started from a project folder, or a bare binary that isn't macOS's own,
-    // plus containers. Python.app/Node in a bundle still count via their project folder.
+    // ponytail: "dev" = a bare binary that isn't macOS's own, plus containers. An .app nested in a
+    // framework (Python.framework/…/Python.app) is an interpreter, not an app, so it counts as bare.
     var isDev: Bool {
-        if project != nil || container != nil || containerRuntimes.contains(name) { return true }
-        return bundlePath == nil && !["/System/", "/usr/libexec/", "/usr/sbin/", "/Library/Apple/"].contains { path.hasPrefix($0) }
+        if container != nil || containerRuntimes.contains(name) { return true }
+        let bare = bundlePath.map { $0.contains(".framework/") } ?? true
+        return bare && !["/System/", "/usr/libexec/", "/usr/sbin/", "/Library/Apple/"].contains { path.hasPrefix($0) }
     }
 }
 
 struct Snapshot {
     var apps: [AppUsage]
     var listeners: [Listener]
-    var cpu: [pid_t: UInt64]
+    var memory: ScanMemory
+}
+
+/// What one scan hands the next, so it only does work that changed.
+struct ScanMemory {
+    /// Per pid: its start time (guards pid reuse), CPU ns so far, and its resolved name.
+    var seen: [pid_t: (start: UInt64, cpu: UInt64, path: String, bundle: String?, name: String)] = [:]
+    /// The last Docker answer and the runtime ports it was asked for.
+    var docker: (ports: [UInt16], at: Date, containers: [Container])?
 }
 
 struct AppUsage: Identifiable {
@@ -162,15 +171,15 @@ private let timebase: (numer: UInt64, denom: UInt64) = {
 /// One pass over every process we're allowed to inspect: memory, CPU and
 /// listening sockets. Root-owned processes (WindowServer, kernel_task) fail
 /// proc_pid_rusage without privileges; they still count in the system totals,
-/// and we couldn't kill them anyway. `prevCPU` maps pid → CPU ns last pass.
-// ponytail: full rescan (~1.4k pids incl. sockets ≈ 40 ms) every 10 s, 2 s while the panel is open.
-func scanProcesses(prevCPU: [pid_t: UInt64], elapsedNs: UInt64) -> Snapshot {
+/// and we couldn't kill them anyway.
+// ponytail: rusage + sockets for every pid each pass (~8 ms for 1.6k pids); names come from `memory`.
+func scanProcesses(_ memory: ScanMemory, elapsedNs: UInt64) -> Snapshot {
     let me = getpid()
     var pids = [pid_t](repeating: 0, count: Int(proc_listallpids(nil, 0)) + 64)
     let n = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
     var groups: [String: AppUsage] = [:]
     var listeners: [Listener] = []
-    var cpuNow: [pid_t: UInt64] = [:]
+    var next = ScanMemory(docker: memory.docker)
     var buf = [UInt8](repeating: 0, count: 4096)
 
     for pid in pids.prefix(max(n, 0)) where pid > 1 && pid != me {
@@ -181,15 +190,19 @@ func scanProcesses(prevCPU: [pid_t: UInt64], elapsedNs: UInt64) -> Snapshot {
         guard ok == 0 else { continue }
         // rusage times are Mach ticks on Apple silicon, not ns.
         let ns = (ri.ri_user_time + ri.ri_system_time) * timebase.numer / timebase.denom
-        cpuNow[pid] = ns
-        let cpu = prevCPU[pid].map { ns >= $0 && elapsedNs > 0 ? Double(ns - $0) / Double(elapsedNs) * 100 : 0 } ?? 0
-
-        let len = Int(proc_pidpath(pid, &buf, UInt32(buf.count)))
-        guard len > 0 else { continue }
-        let path = String(decoding: buf[..<len], as: UTF8.self)
-        let bundle = appBundle(for: path)
-        let name = bundle.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent }
-            ?? displayName(path)
+        var known = memory.seen[pid].flatMap { $0.start == ri.ri_proc_start_abstime ? $0 : nil }
+        let cpu = known.map { ns >= $0.cpu && elapsedNs > 0 ? Double(ns - $0.cpu) / Double(elapsedNs) * 100 : 0 } ?? 0
+        if known == nil {   // new process: resolve its name once
+            let len = Int(proc_pidpath(pid, &buf, UInt32(buf.count)))
+            guard len > 0 else { continue }
+            let path = String(decoding: buf[..<len], as: UTF8.self)
+            let bundle = appBundle(for: path)
+            known = (ri.ri_proc_start_abstime, ns, path, bundle,
+                     bundle.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? displayName(path))
+        }
+        known!.cpu = ns
+        next.seen[pid] = known
+        let (_, _, path, bundle, name) = known!
         groups[name, default: AppUsage(name: name, bundlePath: bundle, pids: [], memory: 0, cpu: 0)].pids.append(pid)
         groups[name]!.memory += ri.ri_phys_footprint
         groups[name]!.cpu += cpu
@@ -203,7 +216,8 @@ func scanProcesses(prevCPU: [pid_t: UInt64], elapsedNs: UInt64) -> Snapshot {
                 started: startTime(pid), memory: ri.ri_phys_footprint))
         }
     }
-    return Snapshot(apps: Array(groups.values), listeners: withContainers(listeners), cpu: cpuNow)
+    let shown = withContainers(listeners, cache: &next.docker)
+    return Snapshot(apps: Array(groups.values), listeners: shown, memory: next)
 }
 
 func listeningPorts(_ pid: pid_t) -> [UInt16] {
@@ -270,6 +284,7 @@ func projectName(_ dir: String) -> String? {
 let containerRuntimes: Set<String> = ["Docker", "OrbStack", "Rancher Desktop"]
 
 /// A row of `GET /containers/json` (field names are the Engine API's).
+/// ponytail: rows are re-fetched when the runtime's ports change or after 60 s (for "Up 3 days").
 struct Container: Decodable {
     let Id: String
     let Names: [String]
@@ -291,10 +306,15 @@ struct Container: Decodable {
 
 /// The runtime's process listens for every published port; swap those ports
 /// for one row per container: name, compose project, image.
-func withContainers(_ listeners: [Listener]) -> [Listener] {
-    guard let runtime = listeners.first(where: { containerRuntimes.contains($0.name) }),
-          let data = dockerAPI("GET", "/containers/json"),
-          let containers = try? JSONDecoder().decode([Container].self, from: data) else { return listeners }
+func withContainers(_ listeners: [Listener], cache: inout (ports: [UInt16], at: Date, containers: [Container])?) -> [Listener] {
+    guard let runtime = listeners.first(where: { containerRuntimes.contains($0.name) }) else { return listeners }
+    let ports = listeners.filter { containerRuntimes.contains($0.name) }.flatMap(\.ports).sorted()
+    if cache == nil || cache!.ports != ports || cache!.at.timeIntervalSinceNow < -60 {
+        guard let data = dockerAPI("GET", "/containers/json"),
+              let fresh = try? JSONDecoder().decode([Container].self, from: data) else { return listeners }
+        cache = (ports, .now, fresh)
+    }
+    let containers = cache!.containers
     let published = Set(containers.flatMap(\.publicPorts))
     var out = listeners.compactMap { l -> Listener? in
         guard containerRuntimes.contains(l.name) else { return l }
@@ -376,23 +396,34 @@ func selfTest() -> Int32 {
     check("cpu ticks", t.total > t.busy && t.busy > 0)
     let used = memoryUsed()
     check("memory used within physical", used > 0 && used < ProcessInfo.processInfo.physicalMemory)
-    let snap = scanProcesses(prevCPU: [:], elapsedNs: 0)
-    check("process scan finds apps", snap.apps.count > 3 && !snap.cpu.isEmpty)
+    let snap = scanProcesses(ScanMemory(), elapsedNs: 0)
+    check("process scan finds apps", snap.apps.count > 3 && !snap.memory.seen.isEmpty)
+    let again = scanProcesses(snap.memory, elapsedNs: 1_000_000_000)
+    let kept = again.memory.seen.filter { snap.memory.seen[$0.key] != nil }
+    check("rescan keeps cached names", kept.count > 100 && kept.allSatisfy { snap.memory.seen[$0.key]!.name == $0.value.name })
     check("process scan skips self", !snap.apps.contains { $0.pids.contains(getpid()) })
 
     // A listener we own must show up with its port, folder and argv.
     let server = Process()
     server.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
-    server.arguments = ["-l", "127.0.0.1", "47999"]
+    server.arguments = ["-l", "127.0.0.1", "61999"]   // ephemeral: never lands in the port ledger
     server.currentDirectoryURL = URL(fileURLWithPath: NSTemporaryDirectory())
     if (try? server.run()) != nil {
         usleep(300_000)
-        let found = scanProcesses(prevCPU: [:], elapsedNs: 0).listeners.first { $0.pid == server.processIdentifier }
-        check("listener: port found", found?.ports == [47999])
-        check("listener: argv read", found?.command == "nc -l 127.0.0.1 47999")
+        let found = scanProcesses(ScanMemory(), elapsedNs: 0).listeners.first { $0.pid == server.processIdentifier }
+        check("listener: port found", found?.ports == [61999])
+        check("listener: argv read", found?.command == "nc -l 127.0.0.1 61999")
         check("listener: is dev", found?.isDev == true)
         server.terminate()
     } else { check("listener: nc started", false) }
+
+    func listener(_ bundle: String?, _ path: String) -> Listener {
+        Listener(pid: 1, ports: [1], name: "", bundlePath: bundle, path: path, dir: "", project: "repo",
+                 command: "", started: .now, memory: 0)
+    }
+    let py = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app"
+    check("dev: framework Python counts", listener(py, py + "/Contents/MacOS/Python").isDev)
+    check("dev: an app in a repo folder doesn't", !listener("/Applications/Warp.app", "/Applications/Warp.app/Contents/MacOS/stable").isDev)
 
     let fixture = #"[{"Id":"abc123def4567890","Names":["/supabase_db"],"Image":"postgres:15","Created":1700000000,"Status":"Up 3 days","Labels":{"com.docker.compose.project":"super-invoices"},"Ports":[{"PrivatePort":5432,"PublicPort":54322,"Type":"tcp"},{"PrivatePort":5432,"PublicPort":54322,"Type":"tcp"},{"PrivatePort":9000,"Type":"tcp"}]}]"#
     let parsed = try? JSONDecoder().decode([Container].self, from: Data(fixture.utf8))

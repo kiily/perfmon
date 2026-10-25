@@ -95,9 +95,8 @@ final class Monitor {
     var ports: [PortUse] = []
 
     /// When the current sample was taken and when the next one is due — drives the refresh ring.
-    var lastSample = Date.distantPast
+    var lastSample = Date.now
     var nextSample = Date.now
-    var hasSampled: Bool { lastSample != .distantPast }
 
     /// Open panel: sample every 2 s. Closed: every 10 s, enough for history and the port ledger.
     var panelOpen = false { didSet { if panelOpen != oldValue { restart() } } }
@@ -106,7 +105,8 @@ final class Monitor {
     private var loop: Task<Void, Never>?
     private var scanning = false
     private var lastTicks = cpuTicks()
-    private var prevCPU: [pid_t: UInt64] = [:]
+    private var memory = ScanMemory()
+    private var recent: [Double] = []   // cpuRecent's backing, filled even while the panel is closed
     private var lastScanNs: UInt64 = 0
     private var pending: (cpu: [Double], watts: [Double], minute: Minute)?
     private var lastSave = Date.now
@@ -144,40 +144,45 @@ final class Monitor {
         defer { scanning = false }
 
         let now = DispatchTime.now().uptimeNanoseconds
-        let prev = prevCPU, elapsed = lastScanNs == 0 ? 0 : now - lastScanNs
-        let snap = await Task.detached(priority: .utility) { scanProcesses(prevCPU: prev, elapsedNs: elapsed) }.value
-        prevCPU = snap.cpu
+        let prev = memory, elapsed = lastScanNs == 0 ? 0 : now - lastScanNs
+        let snap = await Task.detached(priority: .utility) { scanProcesses(prev, elapsedNs: elapsed) }.value
+        memory = snap.memory
         lastScanNs = now
 
+        // What the menu bar label shows: always current.
         let t = cpuTicks()
-        // Animate only what someone is looking at.
-        withAnimation(panelOpen ? .smooth : nil) {
-            if t.total > lastTicks.total {
-                cpu = Double(t.busy - lastTicks.busy) / Double(t.total - lastTicks.total) * 100
-                cpuRecent = (cpuRecent + [cpu]).suffix(60)
-            }
-            memUsed = memoryUsed()
-            pressure = memoryPressure()
-            swap = swapUsed()
-            thermal = ProcessInfo.processInfo.thermalState
-            battery = readBattery()
+        if t.total > lastTicks.total {
+            cpu = Double(t.busy - lastTicks.busy) / Double(t.total - lastTicks.total) * 100
+            recent = (recent + [cpu]).suffix(60)
+        }
+        lastTicks = t
+        pressure = memoryPressure()
+        thermal = ProcessInfo.processInfo.thermalState
+        battery = readBattery()
+        let used = memoryUsed(), swapped = swapUsed()
+        record(snap.apps, used: used, swapped: swapped)
+        recordPorts(snap.listeners)
+        checkAlerts(snap.apps)
+        if lastSave.timeIntervalSinceNow < -600 { save() }
+
+        // Panel-only state: setting it re-renders the panel, so skip that while nobody can see it.
+        guard panelOpen else { return }
+        withAnimation(.smooth) {
+            cpuRecent = recent
+            memUsed = used
+            swap = swapped
             lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
             apps = snap.apps
             listeners = snap.listeners
         }
-        lastTicks = t
         lastSample = .now
         nextSample = .now.addingTimeInterval(interval)
-        record()
-        recordPorts()
-        checkAlerts()
-        if lastSave.timeIntervalSinceNow < -600 { save() }
     }
 
     // MARK: History
 
     /// Folds samples into the current minute; a new minute flushes the old one.
-    private func record() {
+    private func record(_ apps: [AppUsage], used memUsed: UInt64, swapped swap: UInt64) {
         let gb = { (b: UInt64) in (Double(b) / 1_073_741_824 * 10).rounded() / 10 }
         let topMem = apps.max { $0.memory < $1.memory }
         let topCPU = apps.max { $0.cpu < $1.cpu }
@@ -213,12 +218,13 @@ final class Monitor {
         pending = (cpu: [cpu], watts: sample.watts.map { [$0] } ?? [], minute: sample)
     }
 
-    /// Every port a dev server listens on, remembered by project.
-    private func recordPorts() {
+    /// Every port a dev server listens on, remembered by project. Ephemeral ports (49152+,
+    /// e.g. an OAuth callback) aren't worth remembering unless Docker published them.
+    private func recordPorts(_ listeners: [Listener]) {
         let now = Date.now
         for l in listeners where l.isDev {
             let project = l.project ?? l.name
-            for port in l.ports {
+            for port in l.ports where port < 49152 || l.container != nil {
                 if let i = ports.firstIndex(where: { $0.port == port && $0.project == project }) {
                     ports[i].lastSeen = now
                     ports[i].command = l.command
@@ -235,7 +241,7 @@ final class Monitor {
 
     /// One notification per episode (condition turns on), at most every 15 min per kind,
     /// naming the app to blame with a Quit button.
-    private func checkAlerts() {
+    private func checkAlerts(_ apps: [AppUsage]) {
         guard UserDefaults.standard.object(forKey: "alerts") as? Bool ?? true else { return }
         let hog = apps.max { $0.memory < $1.memory }
         let busy = apps.max { $0.cpu < $1.cpu }
