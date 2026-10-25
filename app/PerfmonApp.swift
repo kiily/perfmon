@@ -76,6 +76,12 @@ private struct SavedState: Codable {
     var ports: [PortUse]
 }
 
+/// Adds a minute, replacing any saved copy of it or later (a relaunch, a clock change) and dropping
+/// anything past 24 h. The chart keys on `t`, so a duplicate minute would break it.
+func appending(_ m: Minute, to history: [Minute], now: Date = .now) -> [Minute] {
+    history.filter { $0.t > now.addingTimeInterval(-86_400) && $0.t < m.t } + [m]
+}
+
 // MARK: - Model
 
 @MainActor @Observable
@@ -210,12 +216,16 @@ final class Monitor {
             pending = p
             return
         }
-        if var p = pending {
-            p.minute.cpu = (p.cpu.reduce(0, +) / Double(p.cpu.count)).rounded()
-            p.minute.watts = p.watts.isEmpty ? nil : (p.watts.reduce(0, +) / Double(p.watts.count) * 10).rounded() / 10
-            history = (history + [p.minute]).filter { $0.t > .now.addingTimeInterval(-86_400) }
-        }
+        if let p = pending { history = appending(finished(p), to: history) }
         pending = (cpu: [cpu], watts: sample.watts.map { [$0] } ?? [], minute: sample)
+    }
+
+    /// The pending minute with its samples averaged.
+    private func finished(_ p: (cpu: [Double], watts: [Double], minute: Minute)) -> Minute {
+        var m = p.minute
+        m.cpu = (p.cpu.reduce(0, +) / Double(p.cpu.count)).rounded()
+        m.watts = p.watts.isEmpty ? nil : (p.watts.reduce(0, +) / Double(p.watts.count) * 10).rounded() / 10
+        return m
     }
 
     /// Every port a dev server listens on, remembered by project. Ephemeral ports (49152+,
@@ -259,18 +269,27 @@ final class Monitor {
     }
 
     /// pmset needs root; AppleScript's admin prompt is the sanctioned way to ask for it.
+    /// Off the main actor: the panel and sampling keep running while the password prompt is up.
     func setLowPower(_ on: Bool) {
-        var error: NSDictionary?
-        NSAppleScript(source: "do shell script \"/usr/bin/pmset -a lowpowermode \(on ? 1 : 0)\" with administrator privileges")?
-            .executeAndReturnError(&error)
-        lowPower = error == nil ? on : ProcessInfo.processInfo.isLowPowerModeEnabled
+        Task {
+            let ok = await Task.detached {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                p.arguments = ["-e", "do shell script \"/usr/bin/pmset -a lowpowermode \(on ? 1 : 0)\" with administrator privileges"]
+                guard (try? p.run()) != nil else { return false }
+                p.waitUntilExit()
+                return p.terminationStatus == 0
+            }.value
+            lowPower = ok ? on : ProcessInfo.processInfo.isLowPowerModeEnabled
+        }
     }
 
     func forget(_ use: PortUse) { ports.removeAll { $0.id == use.id } }
 
     func save() {
         lastSave = .now
-        let state = SavedState(history: history, ports: ports)
+        // The minute in progress too, so a quit doesn't drop it; a relaunch in the same minute replaces it.
+        let state = SavedState(history: pending.map { appending(finished($0), to: history) } ?? history, ports: ports)
         try? FileManager.default.createDirectory(at: Self.stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? JSONEncoder().encode(state).write(to: Self.stateURL, options: .atomic)
     }
@@ -319,7 +338,8 @@ final class Alerts: NSObject, UNUserNotificationCenterDelegate {
                 identifier: "hog", actions: [UNNotificationAction(identifier: "quit", title: "Quit \(app.name)")],
                 intentIdentifiers: [])])
             content.categoryIdentifier = "hog"
-            content.userInfo = ["pids": app.pids.map(Int.init), "bundle": app.bundlePath ?? "", "name": app.name]
+            content.userInfo = ["pids": app.pids.map(Int.init), "bundle": app.bundlePath ?? "", "name": app.name,
+                                "starts": app.pids.map { startTime($0).timeIntervalSince1970 }]
         }
         center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
     }
@@ -327,7 +347,8 @@ final class Alerts: NSObject, UNUserNotificationCenterDelegate {
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         guard response.actionIdentifier == "quit" else { return }
         let info = response.notification.request.content.userInfo
-        let pids = (info["pids"] as? [Int] ?? []).map { pid_t($0) }
+        // The banner may be clicked hours later: only signal pids that are still the same processes.
+        let pids = unchanged((info["pids"] as? [Int] ?? []).map { pid_t($0) }, started: info["starts"] as? [Double] ?? [])
         let bundle = (info["bundle"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         let name = info["name"] as? String ?? ""
         await MainActor.run {

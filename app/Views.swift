@@ -301,9 +301,15 @@ struct HistoryChart: View {
                 if let m = selected { readout(m) }
             }
             if history.count < 2 {
-                Text("History fills in while Perfmon runs — \(history.count) min so far.")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 60)
+                HStack(spacing: 10) {
+                    Image(systemName: "chart.xyaxis.line").font(.title3).foregroundStyle(.tint)
+                        .symbolEffect(.variableColor.iterative, options: .repeating)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Recording — the chart draws after 2 minutes").font(.caption)
+                        Gauge(value: Double(history.count), in: 0...2) {}.gaugeStyle(.linearCapacity).controlSize(.mini)
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 60)
             } else {
                 chart
             }
@@ -313,14 +319,15 @@ struct HistoryChart: View {
     }
 
     private var chart: some View {
-        Chart {
-            ForEach(history, id: \.t) { m in
+        let run = runs(history.map(\.t))
+        return Chart {
+            ForEach(Array(history.enumerated()), id: \.element.t) { i, m in
                 if let v = value(m) {
-                    AreaMark(x: .value("Time", m.t), y: .value(metric.rawValue, v))
+                    AreaMark(x: .value("Time", m.t), y: .value(metric.rawValue, v), series: .value("Run", run[i]))
                         .foregroundStyle(.linearGradient(colors: [.accentColor.opacity(0.35), .accentColor.opacity(0.02)],
                                                          startPoint: .top, endPoint: .bottom))
                         .interpolationMethod(.monotone)
-                    LineMark(x: .value("Time", m.t), y: .value(metric.rawValue, v))
+                    LineMark(x: .value("Time", m.t), y: .value(metric.rawValue, v), series: .value("Run", run[i]))
                         .foregroundStyle(Color.accentColor)
                         .lineStyle(StrokeStyle(lineWidth: 1.5))
                         .interpolationMethod(.monotone)
@@ -369,6 +376,7 @@ struct AppList: View {
     var body: some View {
         let sorted = monitor.apps.sorted { sort == .memory ? $0.memory > $1.memory : $0.cpu > $1.cpu }.prefix(8)
         let top = sorted.first.map { sort == .memory ? Double($0.memory) : $0.cpu } ?? 1
+        if monitor.apps.isEmpty { LoadingRows() }
         VStack(alignment: .leading, spacing: 2) {
             ForEach(sorted) { app in
                 AppRow(app: app, sort: sort, share: (sort == .memory ? Double(app.memory) : app.cpu) / max(top, 1)) { force in
@@ -451,10 +459,17 @@ struct ServerList: View {
         let past = monitor.ports.filter { !live.contains($0.port) }.sorted { $0.lastSeen > $1.lastSeen }.prefix(6)
 
         VStack(alignment: .leading, spacing: 2) {
-            if dev.isEmpty {
-                Text("No dev servers running")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 44)
+            if monitor.apps.isEmpty {
+                LoadingRows()   // first sample still in flight: "no servers" would be a lie
+            } else if dev.isEmpty {
+                VStack(spacing: 4) {
+                    Image(systemName: "network").font(.title2).foregroundStyle(.tint)
+                        .symbolEffect(.pulse, options: .repeating)
+                    Text("No dev servers running").font(.callout.weight(.medium))
+                    Text("Start one and it shows up here within seconds")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity).padding(.vertical, 12)
             }
             ForEach(dev) { ServerRow(listener: $0, monitor: monitor) }
             if !other.isEmpty {
@@ -505,10 +520,12 @@ struct ServerRow: View {
             if hovering {
                 Button { NSWorkspace.shared.open(url) } label: { Image(systemName: "safari") }
                     .help("Open \(url.absoluteString)")
-                Button { stop(force: NSEvent.modifierFlags.contains(.option)) } label: {
-                    Image(systemName: "stop.circle.fill")
+                if listener.stoppable {
+                    Button { stop(force: NSEvent.modifierFlags.contains(.option)) } label: {
+                        Image(systemName: "stop.circle.fill")
+                    }
+                    .help("Stop (⌥-click to force)")
                 }
-                .help("Stop (⌥-click to force)")
             } else {
                 // Docker's "Up 7 days (healthy)" → "7 days"
                 Text(listener.status.map { String($0.replacingOccurrences(of: "Up ", with: "").prefix { $0 != "(" }) } ?? age(since: listener.started))
@@ -538,9 +555,11 @@ struct ServerRow: View {
             } else {
                 Button("Copy PID") { copy(String(listener.pid)) }
             }
-            Divider()
-            Button("Stop") { stop(force: false) }
-            Button("Force Stop") { stop(force: true) }
+            if listener.stoppable {
+                Divider()
+                Button("Stop") { stop(force: false) }
+                Button("Force Stop") { stop(force: true) }
+            }
         }
     }
 
@@ -590,6 +609,30 @@ struct PortRow: View {
     }
 }
 
+/// Stand-ins shaped like app rows until the first sample lands; a wave runs down them.
+struct LoadingRows: View {
+    private let widths: [CGFloat] = [130, 95, 150, 80, 115]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(widths.indices, id: \.self) { i in
+                HStack(spacing: 8) {
+                    RoundedRectangle(cornerRadius: 4).frame(width: 18, height: 18)
+                    Capsule().frame(width: widths[i], height: 9)
+                    Spacer()
+                    Capsule().frame(width: 46, height: 9)
+                }
+                .padding(.horizontal, 6).padding(.vertical, 4)
+                .foregroundStyle(.quaternary)
+                .phaseAnimator([0.35, 1]) { $0.opacity($1) } animation: { _ in
+                    .easeInOut(duration: 0.7).delay(Double(i) * 0.09)
+                }
+            }
+        }
+        .accessibilityElement().accessibilityLabel("Loading")
+    }
+}
+
 /// Lays content out at its natural height, scrolling only past `maxHeight`.
 struct CappedScroll<Content: View>: View {
     let maxHeight: CGFloat
@@ -626,4 +669,13 @@ func age(since date: Date) -> String {
 func copy(_ s: String) {
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(s, forType: .string)
+}
+
+/// One series per stretch of contiguous minutes, so the chart doesn't draw a line across a sleep.
+func runs(_ times: [Date]) -> [Int] {
+    var id = 0
+    return times.indices.map { i in
+        if i > 0, times[i].timeIntervalSince(times[i - 1]) > 120 { id += 1 }
+        return id
+    }
 }

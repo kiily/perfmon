@@ -89,15 +89,20 @@ case "${1:-}" in
     # ps knows nothing about pid 0 (kernel_task), so fall back to top's own text.
     CPU_CMD=$(ps -p "${CPU_PID:-0}" -o comm= 2>/dev/null | sed 's|.*/||')
     [ -n "$CPU_CMD" ] || CPU_CMD=$(echo "$CPU_ROW" | awk '{print substr($0, index($0,$3))}' | sed 's/ *$//')
-    MEM_ROW=$(ps -axo pid=,rss=,comm= | sort -k2 -rn | head -1)
-    MEM_PID=$(echo "$MEM_ROW" | awk '{print $1}')
-    MEM_GB=$(echo "$MEM_ROW" | awk '{printf "%.1f", $2/1048576}')
-    MEM_CMD=$(echo "$MEM_ROW" | awk '{print substr($0, index($0,$3))}' | sed 's|.*/||;s/ *$//')
+    # Victims come from fkill's list, memory-sorted: it already leaves out this
+    # shell's ancestry (the terminal you're in) and herdr, same rule everywhere.
+    KILLABLE=$("$BIN_DIR/fkill" --list)
+    MEM_ROW=$(head -1 <<<"$KILLABLE")
+    MEM_PID=$(awk '{print $2}' <<<"$MEM_ROW")
+    MEM_GB=$(awk '{printf "%.1f", $1/1024}' <<<"$MEM_ROW")
+    MEM_CMD=$(ps -p "${MEM_PID:-0}" -o comm= 2>/dev/null | sed 's|.*/||')
+    CPU_OK=0
+    awk -v p="${CPU_PID:-x}" '$2 == p {f=1} END {exit !f}' <<<"$KILLABLE" && CPU_OK=1
 
     printf "\n ${B}top hog${R}\n"
     printf "  ${Y}cpu${R}  %6s%%  %s\n" "${CPU_PCT:-?}" "${CPU_CMD:-?}"
-    if [ "${CPU_PID:-0}" -le 1 ]; then
-      printf "       ${D}not killable — see 'perfmon --why' for what drives it${R}\n"
+    if [ "$CPU_OK" = 0 ]; then
+      printf "       ${D}not killable (system, herdr, or your own shell) — see 'perfmon --why'${R}\n"
     else
       printf "       ${D}copy:${R} ${C}kill -9 %s${R}\n" "$CPU_PID"
     fi
@@ -111,9 +116,9 @@ case "${1:-}" in
     read -r PICK
     VICTIMS=""
     case "${PICK:-}" in
-      c|C) [ "${CPU_PID:-0}" -gt 1 ] && VICTIMS="$CPU_PID" || { echo " cpu hog is not killable"; exit 0; } ;;
+      c|C) [ "$CPU_OK" = 1 ] && VICTIMS="$CPU_PID" || { echo " cpu hog is not killable"; exit 0; } ;;
       m|M) VICTIMS="$MEM_PID" ;;
-      b|B) VICTIMS="$MEM_PID"; [ "${CPU_PID:-0}" -gt 1 ] && VICTIMS="$CPU_PID $MEM_PID" ;;
+      b|B) VICTIMS="$MEM_PID"; [ "$CPU_OK" = 1 ] && VICTIMS="$CPU_PID $MEM_PID" ;;
       *) echo " nothing killed"; exit 0 ;;
     esac
     for pid in $VICTIMS; do
@@ -349,9 +354,13 @@ for pid in ports:
     while q > 1 and len(chain) < 40:
         chain.append(q); q = ppid.get(q, 1)
     if any("herdr" in cmd.get(c, "") for c in chain): continue
-    root = chain[-1]
+    # root = the outermost dev-looking ancestor ("npm run dev"), never the
+    # launchd child: for a server started in Warp/Zed that's the terminal app.
+    devs = [c for c in chain if DEV.search(cmd.get(c, ""))]
+    if not devs: continue
+    root = devs[-1]
     if age.get(root, 0) < MINS*60: continue
-    if any(DEV.search(cmd.get(c, "")) for c in chain): roots.add(root)
+    roots.add(root)
 def tree(p, out):
     out.add(p)
     for k in kids[p]: tree(k, out)

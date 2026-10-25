@@ -7,7 +7,7 @@ Binds 127.0.0.1 only and mints a random token at startup; every request needs
 it. That token plus the Host check and the custom request header are what stop
 any random page in your browser from POSTing to the kill endpoint.
 """
-import http.server, json, os, re, secrets, signal, subprocess, sys, time
+import html, http.server, json, os, re, secrets, signal, subprocess, sys, time
 import urllib.parse, webbrowser
 
 PORT, OPEN = 7777, True
@@ -61,8 +61,10 @@ def procs():
         pid, rss, t, comm = int(m[1]), int(m[2]), cputime(m[3]), m[4].strip()
         cur[pid] = t
         pct = (t - _prev[pid]) / elapsed * 100 if elapsed > 0 and pid in _prev else 0.0
+        # html-escaped here: the page drops these into innerHTML, and any local
+        # user can name a process "<img onerror=…>".
         rows.append({"pid": pid, "mb": rss / 1024, "cpu": round(max(pct, 0.0), 1),
-                     "name": comm.rsplit("/", 1)[-1], "path": comm,
+                     "name": html.escape(comm.rsplit("/", 1)[-1]), "path": html.escape(comm),
                      "safe": pid in SAFE or pid <= 1})
     _prev, _prev_t = cur, now
     return rows

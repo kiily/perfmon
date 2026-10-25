@@ -36,6 +36,8 @@ struct Listener: Identifiable {
         let bare = bundlePath.map { $0.contains(".framework/") } ?? true
         return bare && !["/System/", "/usr/libexec/", "/usr/sbin/", "/Library/Apple/"].contains { path.hasPrefix($0) }
     }
+    /// Docker Desktop's own row (ports no container claims): stopping it would stop Docker.
+    var stoppable: Bool { container != nil || !containerRuntimes.contains(name) }
 }
 
 struct Snapshot {
@@ -46,8 +48,10 @@ struct Snapshot {
 
 /// What one scan hands the next, so it only does work that changed.
 struct ScanMemory {
-    /// Per pid: its start time (guards pid reuse), CPU ns so far, and its resolved name.
-    var seen: [pid_t: (start: UInt64, cpu: UInt64, path: String, bundle: String?, name: String)] = [:]
+    /// Per pid: its start time (guards pid reuse), CPU ns so far, its resolved name and,
+    /// once it listens, what the server row shows (argv, folder, repo don't change).
+    var seen: [pid_t: (start: UInt64, cpu: UInt64, path: String, bundle: String?, name: String, server: Server?)] = [:]
+    struct Server { var dir: String, project: String?, command: String, started: Date }
     /// The last Docker answer and the runtime ports it was asked for.
     var docker: (ports: [UInt16], at: Date, containers: [Container])?
 }
@@ -198,23 +202,26 @@ func scanProcesses(_ memory: ScanMemory, elapsedNs: UInt64) -> Snapshot {
             let path = String(decoding: buf[..<len], as: UTF8.self)
             let bundle = appBundle(for: path)
             known = (ri.ri_proc_start_abstime, ns, path, bundle,
-                     bundle.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? displayName(path))
+                     bundle.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? displayName(path), nil)
         }
         known!.cpu = ns
-        next.seen[pid] = known
-        let (_, _, path, bundle, name) = known!
+        let (_, _, path, bundle, name, _) = known!
         groups[name, default: AppUsage(name: name, bundlePath: bundle, pids: [], memory: 0, cpu: 0)].pids.append(pid)
         groups[name]!.memory += ri.ri_phys_footprint
         groups[name]!.cpu += cpu
 
         let ports = listeningPorts(pid)
         if !ports.isEmpty {
-            let dir = workingDirectory(pid)
+            if known!.server == nil {
+                let dir = workingDirectory(pid)
+                known!.server = .init(dir: dir, project: projectName(dir), command: shortCommand(arguments(pid)), started: startTime(pid))
+            }
+            let s = known!.server!
             listeners.append(Listener(
-                pid: pid, ports: ports, name: name, bundlePath: bundle, path: path, dir: dir,
-                project: projectName(dir), command: shortCommand(arguments(pid)),
-                started: startTime(pid), memory: ri.ri_phys_footprint))
+                pid: pid, ports: ports, name: name, bundlePath: bundle, path: path, dir: s.dir,
+                project: s.project, command: s.command, started: s.started, memory: ri.ri_phys_footprint))
         }
+        next.seen[pid] = known
     }
     let shown = withContainers(listeners, cache: &next.docker)
     return Snapshot(apps: Array(groups.values), listeners: shown, memory: next)
@@ -365,6 +372,11 @@ func dockerAPI(_ method: String, _ path: String, timeout: Int = 2) -> Data? {
     return nil
 }
 
+/// The pids that are still the processes we saw: a reused pid has a different start time.
+func unchanged(_ pids: [pid_t], started: [TimeInterval]) -> [pid_t] {
+    zip(pids, started).filter { startTime($0.0).timeIntervalSince1970 == $0.1 }.map(\.0)
+}
+
 /// Graceful first: a running app gets a normal Quit (it may ask to save).
 /// Returns false when nothing could be signalled (e.g. another user's process).
 @MainActor
@@ -414,6 +426,9 @@ func selfTest() -> Int32 {
         check("listener: port found", found?.ports == [61999])
         check("listener: argv read", found?.command == "nc -l 127.0.0.1 61999")
         check("listener: is dev", found?.isDev == true)
+        let first = scanProcesses(ScanMemory(), elapsedNs: 0)
+        let cached = scanProcesses(first.memory, elapsedNs: 1).memory.seen[server.processIdentifier]?.server
+        check("listener: details cached across scans", cached?.command == "nc -l 127.0.0.1 61999" && cached?.dir != nil)
         server.terminate()
     } else { check("listener: nc started", false) }
 
@@ -424,6 +439,15 @@ func selfTest() -> Int32 {
     let py = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app"
     check("dev: framework Python counts", listener(py, py + "/Contents/MacOS/Python").isDev)
     check("dev: an app in a repo folder doesn't", !listener("/Applications/Warp.app", "/Applications/Warp.app/Contents/MacOS/stable").isDev)
+    var runtime = listener("/Applications/Docker.app", "/Applications/Docker.app/Contents/MacOS/com.docker.backend")
+    runtime.name = "Docker"
+    check("stop: Docker's own row can't be stopped", !runtime.stoppable)
+    runtime.container = "abc"
+    check("stop: a container can", runtime.stoppable && listener(nil, "/opt/homebrew/bin/node").stoppable)
+
+    let me = getpid(), born = startTime(me).timeIntervalSince1970
+    check("quit: a live pid is kept", unchanged([me], started: [born]) == [me])
+    check("quit: a reused pid is dropped", unchanged([me], started: [born - 60]).isEmpty)
 
     let fixture = #"[{"Id":"abc123def4567890","Names":["/supabase_db"],"Image":"postgres:15","Created":1700000000,"Status":"Up 3 days","Labels":{"com.docker.compose.project":"super-invoices"},"Ports":[{"PrivatePort":5432,"PublicPort":54322,"Type":"tcp"},{"PrivatePort":5432,"PublicPort":54322,"Type":"tcp"},{"PrivatePort":9000,"Type":"tcp"}]}]"#
     let parsed = try? JSONDecoder().decode([Container].self, from: Data(fixture.utf8))
@@ -433,6 +457,16 @@ func selfTest() -> Int32 {
         let live = dockerAPI("GET", "/containers/json").flatMap { try? JSONDecoder().decode([Container].self, from: $0) }
         check("docker: engine API answers", live != nil)
     }
+
+    func minute(_ t: Date) -> Minute {
+        Minute(t: t, cpu: 0, mem: 0, swap: 0, pressure: 1, thermal: 0, watts: nil, battery: nil,
+               topMem: "", topMemGB: 0, topCPU: "", topCPUPct: 0)
+    }
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+    check("history: a re-saved minute isn't duplicated",
+          appending(minute(t0), to: [minute(t0 - 60), minute(t0)], now: t0).map(\.t) == [t0 - 60, t0])
+    check("history: past 24 h dropped", appending(minute(t0), to: [minute(t0 - 90_000)], now: t0).count == 1)
+    check("chart: a sleep gap starts a new run", runs([t0, t0 + 60, t0 + 3600, t0 + 3660]) == [0, 0, 1, 1])
 
     if let b = readBattery() { check("battery percent", (0...100).contains(b.percent)) }
     return failed ? 1 : 0

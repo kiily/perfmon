@@ -149,6 +149,12 @@ if poll web_up; then
   API="http://127.0.0.1:$WPORT"
   check "perfweb serves page"      bash -c "curl -sf '$API/?t=$WTOK' | grep -q 'perfmon'"
   check "perfweb stats json"       bash -c "curl -sf '$API/api/stats?t=$WTOK' | grep -q '\"procs\"'"
+  # A process named like markup must reach the page escaped (the page uses innerHTML).
+  XSS=$(python3 -c "import subprocess as s; print(s.Popen(['/tmp/<i>xss$$','600'], executable='/bin/sleep', start_new_session=True, stdout=s.DEVNULL, stderr=s.DEVNULL).pid)")
+  xss_escaped() { curl -sf "$API/api/stats?t=$WTOK" | grep -q "&lt;i&gt;xss$$"; }
+  check "perfweb escapes process names" poll xss_escaped
+  check "perfweb sends no raw markup"   fails bash -c "curl -sf '$API/api/stats?t=$WTOK' | grep -q '<i>xss$$'"
+  kill "$XSS" 2>/dev/null
   check "perfweb rejects no token" bash -c "! curl -sf '$API/api/stats'"
   check "perfweb rejects bad host" bash -c "! curl -sf -H 'Host: evil.com' '$API/api/stats?t=$WTOK'"
   check "perfweb kill needs header" bash -c "! curl -sf -X POST -d '{\"pid\":1}' '$API/api/kill?t=$WTOK'"
@@ -169,6 +175,12 @@ check "perfmon --guide"        bash -c "perfmon --guide | grep -q 'already in us
 check "perfmon --cheats"       bash -c "perfmon --cheats | grep -q 'fkill --port'"
 check "perfmon --hog"          bash -c "perfmon --hog | grep -q 'kill -9'"
 check "perfmon --hog never prompts piped" bash -c "! perfmon --hog </dev/null | grep -q 'kill now'"
+# The memory victim must come from fkill's exclusion-filtered list, never from
+# this shell's ancestry (the terminal running the test).
+HOG_MEM=$(perfmon --hog </dev/null | awk '/ mem /{getline; print $NF}')
+ANCESTRY=$(p=$$; while [ "$p" -gt 1 ]; do echo "$p"; p=$(ps -o ppid= -p "$p" | tr -d ' '); done)
+check "perfmon --hog victim is a candidate" bash -c "fkill --list | awk '{print \$2}' | grep -qx '$HOG_MEM'"
+check "perfmon --hog spares ancestry"    fails grep -qx "$HOG_MEM" <<<"$ANCESTRY"
 check "perfmon --servers"     bash -c "perfmon --servers | grep -q 'localhost servers'"
 # --- perfmon --reap -------------------------------------------------------
 # An orphan (ppid 1) holding a port, dev-looking name, no herdr pane above it:
@@ -188,6 +200,18 @@ if poll bash -c "lsof -nP -iTCP:39251 -sTCP:LISTEN >/dev/null 2>&1"; then
 else
   echo "skip perfmon --reap checks (could not start the orphan)"
 fi
+# Same server under a long-lived non-dev parent (a terminal app, in real life):
+# the parent must never be in the kill set. The path goes in via env so the
+# parent's own command line doesn't look like a dev server.
+REAP_PARENT=$(REAP_JS="$REAP_JS" python3 -c "import subprocess as s; print(s.Popen(['bash','-c','node \"\$REAP_JS\" & wait','perfmon-smoke-term'], start_new_session=True, stdout=s.DEVNULL, stderr=s.DEVNULL).pid)")
+if poll bash -c "lsof -nP -iTCP:39251 -sTCP:LISTEN >/dev/null 2>&1"; then
+  OUT=$(perfmon --reap 0)
+  check "perfmon --reap spots the child" grep -q 39251 <<<"$OUT"
+  check "perfmon --reap spares the parent" fails grep -qE "pids:.*\b$REAP_PARENT\b" <<<"$OUT"
+else
+  echo "skip perfmon --reap parent check (could not start the server)"
+fi
+pkill -P "$REAP_PARENT" 2>/dev/null; kill "$REAP_PARENT" 2>/dev/null
 rm -f "$REAP_JS"
 
 check "perfmon --why"          bash -c "perfmon --why | grep -q 'top cpu'"
